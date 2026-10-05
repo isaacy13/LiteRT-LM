@@ -69,3 +69,23 @@ code. Failed work is retained separately with source/archive identity and an
 explicit rejection marker; the untouched Bazel framework archive is uploaded even
 on failure. Existing evidence is never replaced. This enables diagnosis of the
 actual binary without weakening any package or runtime acceptance check.
+
+## Preserve signatures until final packaging
+
+The exact 0e5e7aa gate built both slices and passed 105 native cases, but runner
+Xcode 16.4 rejected the simulator C API ID rewrite after signature removal.
+Retained headers show eight padding bytes between the string table and the old
+signature location. Removing that signature leaves those bytes at the end of
+`__LINKEDIT`. This is the observed failing tool sequence; complete binary
+validation and the runner-specific cause still require verification.
+
+Linkage changes now operate on signed copies before the existing final framework
+signing replaces their invalidated signatures. Original binaries remain intact;
+all source, platform, signature and dependency checks remain required. One real
+retained simulator copy accepted ID/dependency changes and final signing on the
+local newer Xcode. Its signature-removal output differs from the runner's, and
+both command orders succeed locally, so this is not a runner reproduction or full
+package acceptance. The first local probe's import failure and second probe's
+incorrect byte-equality assumption are retained separately. A producer control
+checks that linkage rewriting never strips signatures and still rewrites every
+required dependency. The next complete SDK gate remains required before adoption.

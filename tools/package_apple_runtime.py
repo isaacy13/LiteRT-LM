@@ -84,9 +84,9 @@ def framework_metadata(name, platform):
 
 
 def rewrite_linkage(binary, name):
-    if subprocess.run(["codesign", "-d", str(binary)], stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode == 0:
-        run("codesign", "--remove-signature", str(binary))
+    # Rewrite the signed copy, then replace its signature when the completed
+    # framework is sealed. Early removal can leave signature-alignment padding
+    # at the end of __LINKEDIT that older install_name_tool versions reject.
     run("install_name_tool", "-id", install_name(name), str(binary))
     for dependency in dependencies(binary):
         old = dependency.removeprefix("@rpath/")

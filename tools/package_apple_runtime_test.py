@@ -8,7 +8,25 @@ import tempfile
 from unittest.mock import patch
 
 from package_apple_runtime import (LIBRARIES, install_name, validate_dependencies,
-                                 retained_package_work, run)
+                                 retained_package_work, rewrite_linkage, run)
+
+
+class ApplePackageSigningOrderTests(unittest.TestCase):
+    def testLinkageRewriteDoesNotStripSignedInputs(self):
+        binary = Path("fixture-framework/CLiteRTLM")
+        linked = ["@rpath/" + name for name in LIBRARIES]
+        with patch("package_apple_runtime.dependencies", return_value=linked), \
+                patch("package_apple_runtime.run") as native, \
+                patch("package_apple_runtime.subprocess.run") as signature_probe:
+            rewrite_linkage(binary, "CLiteRTLM")
+        signature_probe.assert_not_called()
+        self.assertEqual(native.call_args_list[0].args,
+                         ("install_name_tool", "-id", install_name("CLiteRTLM"), str(binary)))
+        self.assertEqual(len(native.call_args_list), 1 + len(LIBRARIES))
+        for call, dependency in zip(native.call_args_list[1:], linked):
+            self.assertEqual(call.args,
+                             ("install_name_tool", "-change", dependency,
+                              install_name(LIBRARIES[dependency.removeprefix("@rpath/")]), str(binary)))
 
 
 class AppleRuntimeClosureTests(unittest.TestCase):
