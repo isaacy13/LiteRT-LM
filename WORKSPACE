@@ -394,6 +394,8 @@ http_archive(
 
 http_archive(
     name = "litert",
+    patches = ["//patches:litert_ios_runtime_import.patch"],
+    patch_args = ["-p1"],
     patch_cmds = [
         # Replace @//third_party with @litert//third_party in files under third_party/.
         "sed -i -e 's|\"@//third_party/|\"@litert//third_party/|g' third_party/*/*",
