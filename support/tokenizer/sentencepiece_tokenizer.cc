@@ -23,9 +23,11 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/str_replace.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "sentencepiece_model.pb.h"  // from @sentencepiece
+#include "model_interface.h"  // from @sentencepiece
 #include "sentencepiece_processor.h"  // from @sentencepiece
 
 namespace litert::support {
@@ -120,6 +122,28 @@ std::vector<std::string> SentencePieceTokenizer::GetTokens() const {
 
 int SentencePieceTokenizer::GetVocabSize() const {
   return processor_->GetPieceSize();
+}
+
+ConstraintVocabulary SentencePieceTokenizer::GetConstraintVocabulary() const {
+  ConstraintVocabulary vocabulary;
+  vocabulary.token_bytes.reserve(vocab_size_);
+  for (int id = 0; id < vocab_size_; ++id) {
+    const std::string& piece = processor_->IdToPiece(id);
+    if (processor_->IsControl(id) || processor_->IsUnknown(id) ||
+        processor_->IsUnused(id)) {
+      vocabulary.token_bytes.push_back(piece);
+      vocabulary.special_token_ids.push_back(id);
+    } else if (processor_->IsByte(id)) {
+      vocabulary.token_bytes.emplace_back(
+          1, static_cast<char>(sentencepiece::PieceToByte(piece)));
+    } else {
+      // Isolated Decode strips the BOS prefix and replaces incomplete bytes.
+      // Constraints instead need the decoder's continuation byte mapping.
+      vocabulary.token_bytes.push_back(
+          absl::StrReplaceAll(piece, {{"\xe2\x96\x81", " "}}));
+    }
+  }
+  return vocabulary;
 }
 
 }  // namespace litert::support

@@ -49,7 +49,7 @@ HuggingFaceTokenizer::CreateFromJson(const std::string& json) {
   if (!handle) {
     return absl::InvalidArgumentError("Failed to create tokenizer from JSON.");
   }
-  return absl::WrapUnique(new HuggingFaceTokenizer(handle));
+  return absl::WrapUnique(new HuggingFaceTokenizer(handle, json));
 }
 
 // Encodes the given text into a TensorBuffer of token ids.

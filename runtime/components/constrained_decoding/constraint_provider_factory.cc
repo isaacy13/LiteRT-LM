@@ -40,6 +40,11 @@ absl::StatusOr<std::unique_ptr<ConstraintProvider>> CreateConstraintProvider(
                  constraint_provider_config)) {
     auto llg_guidance_config =
         std::get<LlGuidanceConfig>(constraint_provider_config);
+    for (const auto& stop_sequence : stop_token_ids) {
+      if (stop_sequence.size() == 1) {
+        llg_guidance_config.special_token_ids.push_back(stop_sequence[0]);
+      }
+    }
     if (!llg_guidance_config.eos_id.has_value()) {
       // If eos_id is not provided in the config, use the first valid stop token
       // as the eos_id.

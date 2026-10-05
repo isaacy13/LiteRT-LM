@@ -65,6 +65,8 @@ class SentencePieceTokenizer : public Tokenizer {
   // Returns the tokens in the SentencePiece model.
   std::vector<std::string> GetTokens() const override;
 
+  ConstraintVocabulary GetConstraintVocabulary() const override;
+
   // Returns the size of the vocabulary.
   int GetVocabSize() const override;
 

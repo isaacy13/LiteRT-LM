@@ -28,6 +28,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/constraint_provider_config.h"
@@ -66,7 +67,59 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     return absl::InvalidArgumentError("LlGuidanceConfig::eos_id must be set.");
   }
 
-  std::vector<std::string> tokens = tokenizer.GetTokens();
+  auto vocabulary = tokenizer.GetConstraintVocabulary();
+  auto& tokens = vocabulary.token_bytes;
+  if (*llg_config.eos_id >= tokens.size()) {
+    return absl::InvalidArgumentError("LLGuidance EOS is outside vocabulary.");
+  }
+  std::vector<bool> special(tokens.size(), false);
+  vocabulary.special_token_ids.insert(vocabulary.special_token_ids.end(),
+                                     llg_config.special_token_ids.begin(),
+                                     llg_config.special_token_ids.end());
+  vocabulary.special_token_ids.push_back(*llg_config.eos_id);
+  for (int id : vocabulary.special_token_ids) {
+    if (id < 0 || id >= tokens.size()) {
+      return absl::InvalidArgumentError(
+          "LLGuidance special token is outside vocabulary.");
+    }
+    special[id] = true;
+  }
+
+  std::string tokenizer_json;
+  if (vocabulary.tokenizer_json.has_value()) {
+    auto json = nlohmann::json::parse(*vocabulary.tokenizer_json,
+                                     /*cb=*/nullptr, /*allow_exceptions=*/false);
+    if (!json.is_object()) {
+      return absl::InvalidArgumentError("Invalid HF constraint tokenizer JSON.");
+    }
+    auto& added = json["added_tokens"];
+    if (added.is_null()) added = nlohmann::json::array();
+    if (!added.is_array()) {
+      return absl::InvalidArgumentError("HF added_tokens must be an array.");
+    }
+    for (int id = 0; id < special.size(); ++id) {
+      if (!special[id]) continue;
+      bool found = false;
+      for (auto& token : added) {
+        if (token.is_object() && token.contains("id") && token["id"] == id) {
+          token["special"] = true;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        added.push_back({{"id", id}, {"content", tokens[id]}, {"special", true}});
+      }
+    }
+    tokenizer_json = json.dump();
+  } else {
+    for (int id = 0; id < tokens.size(); ++id) {
+      if (special[id]) {
+        // llguidance's native marker distinguishes control IDs from text.
+        tokens[id].insert(tokens[id].begin(), static_cast<char>(0xff));
+      }
+    }
+  }
 
   std::vector<uint32_t> token_lens;
   std::vector<uint8_t> token_bytes;
@@ -108,7 +161,8 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
       .tok_eos = *llg_config.eos_id,
       .token_lens = token_lens.data(),
       .token_bytes = token_bytes.data(),
-      .tokenize_assumes_string = false,
+      .tokenizer_json = tokenizer_json.empty() ? nullptr : tokenizer_json.c_str(),
+      .tokenize_assumes_string = true,
       .tokenize_fn = tokenize_fn,
       .tokenize_user_data = &tokenizer,
   };

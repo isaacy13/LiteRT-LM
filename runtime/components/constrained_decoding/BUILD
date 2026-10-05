@@ -278,6 +278,7 @@ cc_library(
         ":constraint_provider_config",
         ":llg_constraint",
         ":llg_constraint_config",
+        "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -412,6 +413,26 @@ cc_test(
         "//support/tokenizer",
         "//runtime/util:test_utils",
         "@crate_index__llguidance-1.3.0//:llguidance_cc"
+    ],
+)
+
+cc_test(
+    name = "constraint_vocabulary_test",
+    srcs = ["constraint_vocabulary_test.cc"],
+    data = ["//support/tokenizer/testdata"],
+    deps = [
+        ":constraint",
+        ":constraint_provider_factory",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":logit_mask",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "//support/tokenizer:sentencepiece_tokenizer",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

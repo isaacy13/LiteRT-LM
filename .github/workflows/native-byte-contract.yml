@@ -1,0 +1,73 @@
+name: Native byte contract
+
+on:
+  push:
+    branches: [codex/native-tokenizer-byte-contract]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-byte-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          lfs: false
+      - name: Fetch only required native platform libraries
+        run: |
+          git lfs install --local
+          git lfs pull --include='prebuilt/macos_arm64/*.dylib,prebuilt/ios_arm64/*.dylib,prebuilt/ios_sim_arm64/*.dylib'
+      - name: Install pinned Bazelisk
+        run: |
+          test "$(uname -m)" = arm64
+          curl -fL --retry 3 -o "$RUNNER_TEMP/bazelisk" https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-darwin-arm64
+          echo 'cee851f726789227d5561004e9904a52be45c3efb56f8b38b6993d6adbaa0409  '"$RUNNER_TEMP/bazelisk" | shasum -a 256 -c -
+          chmod +x "$RUNNER_TEMP/bazelisk"
+      - name: Native tokenizer and constraint regressions
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --test_output=all \
+            //support/tokenizer:sentencepiece_tokenizer_test \
+            //support/tokenizer:huggingface_tokenizer_test \
+            //runtime/components/constrained_decoding:constraint_vocabulary_test \
+            //runtime/components/constrained_decoding:constraint_provider_factory_test \
+            //runtime/components/constrained_decoding:llg_constraint_provider_test \
+            //runtime/components/constrained_decoding:llg_constraint_test \
+            //runtime/components/constrained_decoding:llg_fc_tool_calls_test \
+            //runtime/components/constrained_decoding:llg_python_tool_calls_test \
+            2>&1 | tee native-tests.log
+      - name: Build device and simulator framework
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            //swift:CLiteRTLM 2>&1 | tee native-framework.log
+          mkdir native-artifact
+          cp bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact/
+          shasum -a 256 native-artifact/CLiteRTLM.xcframework.zip > native-artifact/SHA256SUMS
+          git rev-parse HEAD > native-artifact/SOURCE_COMMIT
+      - name: Retain native evidence and framework
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-byte-contract-${{ github.sha }}
+          path: |
+            native-tests.log
+            native-framework.log
+            native-artifact/
+            bazel-testlogs/support/tokenizer/**/test.xml
+            bazel-testlogs/support/tokenizer/**/test.log
+            bazel-testlogs/runtime/components/constrained_decoding/**/test.xml
+            bazel-testlogs/runtime/components/constrained_decoding/**/test.log
+          if-no-files-found: warn
