@@ -78,5 +78,7 @@ jobs:
             native-framework.log
             native-package.log
             native-artifact/
+            native-artifact-failure/
+            bazel-bin/swift/CLiteRTLM.xcframework.zip
             native-test-results/
           if-no-files-found: warn

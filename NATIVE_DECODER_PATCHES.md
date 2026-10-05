@@ -58,3 +58,14 @@ signing, actual Metal execution and sampling, constrained text/tool generation,
 cancellation, full-app memory/thermal behavior and battery cost remain required
 before GuideAI adopts this SDK. The package still requires its new build gate;
 these source changes alone make no runtime acceptance claim.
+
+## Package failure diagnostics
+
+The e730273 native gate passed 105 test cases and built both framework slices,
+but `install_name_tool -id` failed during packaging. Its captured diagnostic was
+missing from the traceback, and the temporary packaging files were deleted. The
+root cause is unverified. Command failures now report the captured output and exit
+code. Failed work is retained separately with source/archive identity and an
+explicit rejection marker; the untouched Bazel framework archive is uploaded even
+on failure. Existing evidence is never replaced. This enables diagnosis of the
+actual binary without weakening any package or runtime acceptance check.
