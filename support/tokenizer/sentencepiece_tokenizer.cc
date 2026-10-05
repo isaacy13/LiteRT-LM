@@ -14,6 +14,7 @@
 
 #include "support/tokenizer/sentencepiece_tokenizer.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -168,14 +169,18 @@ ConstraintVocabulary SentencePieceTokenizer::GetConstraintVocabulary() const {
 }
 
 absl::StatusOr<TokenIds> SentencePieceTokenizer::BytesToTokenIdsForConstraint(
-    absl::string_view bytes) {
+    absl::string_view bytes, absl::Span<const int> excluded_token_ids) {
+  auto excluded = [&](int id) {
+    return std::find(excluded_token_ids.begin(), excluded_token_ids.end(), id) !=
+           excluded_token_ids.end();
+  };
   auto encoded = TextToTokenIds(bytes);
   if (encoded.ok()) {
     std::string reconstructed;
     reconstructed.reserve(bytes.size());
     bool ordinary = true;
     for (int id : *encoded) {
-      if (IsConstraintControl(*processor_, id)) {
+      if (IsConstraintControl(*processor_, id) || excluded(id)) {
         ordinary = false;
         break;
       }
@@ -190,7 +195,7 @@ absl::StatusOr<TokenIds> SentencePieceTokenizer::BytesToTokenIdsForConstraint(
   exact.reserve(bytes.size());
   for (unsigned char byte : bytes) {
     int id = byte_token_ids_[byte];
-    if (id < 0) {
+    if (id < 0 || excluded(id)) {
       return absl::InvalidArgumentError(
           "SentencePiece cannot encode constraint bytes faithfully.");
     }

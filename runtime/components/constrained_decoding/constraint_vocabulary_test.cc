@@ -87,6 +87,35 @@ TEST(ConstraintVocabularyTest, SentencePieceKeepsSpacesUnicodeAndLiteralAngles) 
   }
 }
 
+void SampleAndCheckNativeText(const Constraint& constraint, Tokenizer& tokenizer,
+                              const std::string& expected, int eos) {
+  auto state = constraint.Start();
+  std::vector<int> tokens;
+  bool completed = false;
+  for (int step = 0; step < 128; ++step) {
+    ASSERT_OK_AND_ASSIGN(auto mask, constraint.ComputeMask(*state));
+    ASSERT_EQ(mask->GetType(), MaskType::kBitmap);
+    const auto& bitmap = static_cast<const BitmapLogitMask&>(*mask);
+    if (bitmap.IsAllowed(eos)) {
+      completed = true;
+      break;
+    }
+    int selected = -1;
+    for (int id = 0; id < constraint.GetVocabularySize(); ++id) {
+      if (bitmap.IsAllowed(id)) {
+        selected = id;
+        break;
+      }
+    }
+    ASSERT_GE(selected, 0);
+    ASSERT_OK_AND_ASSIGN(state, constraint.ComputeNext(*state, selected));
+    tokens.push_back(selected);
+  }
+  EXPECT_TRUE(completed);
+  ASSERT_OK_AND_ASSIGN(auto output, tokenizer.TokenIdsToText(tokens));
+  EXPECT_EQ(output, expected);
+}
+
 TEST(ConstraintVocabularyTest, ByteFallbackPreservesLiteralSpaceSymbol) {
   ASSERT_OK_AND_ASSIGN(auto tokenizer,
                       SentencePieceTokenizer::CreateFromFile(GemmaTokenizerPath()));
@@ -95,31 +124,23 @@ TEST(ConstraintVocabularyTest, ByteFallbackPreservesLiteralSpaceSymbol) {
   ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
       LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kJsonSchema,
                              .constraint_string = R"({"type":"string","enum":["▁🧭"]})"}));
-  auto state = constraint->Start();
-  std::vector<int> tokens;
-  bool completed = false;
-  for (int step = 0; step < 64; ++step) {
-    ASSERT_OK_AND_ASSIGN(auto mask, constraint->ComputeMask(*state));
-    ASSERT_EQ(mask->GetType(), MaskType::kBitmap);
-    const auto& bitmap = static_cast<const BitmapLogitMask&>(*mask);
-    if (bitmap.IsAllowed(1)) {
-      completed = true;
-      break;
-    }
-    int selected = -1;
-    for (int id = 0; id < constraint->GetVocabularySize(); ++id) {
-      if (bitmap.IsAllowed(id)) {
-        selected = id;
-        break;
-      }
-    }
-    ASSERT_GE(selected, 0);
-    ASSERT_OK_AND_ASSIGN(state, constraint->ComputeNext(*state, selected));
-    tokens.push_back(selected);
+  SampleAndCheckNativeText(*constraint, *tokenizer, "\"▁🧭\"", 1);
+}
+
+TEST(ConstraintVocabularyTest, LiteralStopSpellingsUseTextInsteadOfControlIDs) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer,
+                      SentencePieceTokenizer::CreateFromFile(GemmaTokenizerPath()));
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateConstraintProvider(
+      LlGuidanceConfig{.eos_id = 1}, *tokenizer, {{1}, {50}, {106}}));
+  for (const auto& value : {"<end_of_turn>", "<unused44>",
+                           "literal <end_of_turn> marker", "café 東京 🧭"}) {
+    SCOPED_TRACE(value);
+    const std::string quoted = "\"" + std::string(value) + "\"";
+    ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
+        LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kJsonSchema,
+            .constraint_string = "{\"type\":\"string\",\"enum\":[" + quoted + "]}"}));
+    SampleAndCheckNativeText(*constraint, *tokenizer, quoted, 1);
   }
-  EXPECT_TRUE(completed);
-  ASSERT_OK_AND_ASSIGN(auto output, tokenizer->TokenIdsToText(tokens));
-  EXPECT_EQ(output, "\"▁🧭\"");
 }
 
 TEST(ConstraintVocabularyTest, EverySingleTokenStopIsBlockedInOpenJSON) {

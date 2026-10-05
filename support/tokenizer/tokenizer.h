@@ -97,8 +97,18 @@ class Tokenizer {
 
   // Preserve requested bytes without BOS insertion or source normalization.
   virtual absl::StatusOr<TokenIds> BytesToTokenIdsForConstraint(
-      absl::string_view bytes) {
-    return TextToTokenIds(bytes);
+      absl::string_view bytes, absl::Span<const int> excluded_token_ids = {}) {
+    auto encoded = TextToTokenIds(bytes);
+    if (!encoded.ok()) return encoded;
+    for (int id : *encoded) {
+      for (int excluded : excluded_token_ids) {
+        if (id == excluded) {
+          return absl::InvalidArgumentError(
+              "Constraint text encoded as a reserved control token.");
+        }
+      }
+    }
+    return encoded;
   }
 
   // Returns the size of the vocabulary.

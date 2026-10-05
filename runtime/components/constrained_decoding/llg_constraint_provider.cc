@@ -114,7 +114,8 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     tokenizer_json = json.dump();
   } else {
     for (int id = 0; id < tokens.size(); ++id) {
-      if (special[id]) {
+      if (special[id] && (tokens[id].empty() ||
+                         static_cast<uint8_t>(tokens[id].front()) != 0xff)) {
         // llguidance's native marker distinguishes control IDs from text.
         tokens[id].insert(tokens[id].begin(), static_cast<char>(0xff));
       }
@@ -136,16 +137,16 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     token_bytes.insert(token_bytes.end(), token.begin(), token.end());
   }
 
+  auto context = std::make_unique<TokenizationContext>(TokenizationContext{
+      const_cast<Tokenizer&>(tokenizer), vocabulary.special_token_ids});
   auto tokenize_fn = [](const void* user_data, const uint8_t* bytes,
                         size_t bytes_len, uint32_t* output_tokens,
                         size_t output_tokens_len) -> size_t {
     absl::string_view text(reinterpret_cast<const char*>(bytes), bytes_len);
 
-    // The tokenizer is passed as `user_data` to tokenize_fn. It needs to be
-    // cast back into a Tokenizer*.
-    Tokenizer* tokenizer =
-        static_cast<Tokenizer*>(const_cast<void*>(user_data));
-    auto token_ids = tokenizer->BytesToTokenIdsForConstraint(text);
+    const auto& context = *static_cast<const TokenizationContext*>(user_data);
+    auto token_ids = context.tokenizer.BytesToTokenIdsForConstraint(
+        text, context.special_token_ids);
     if (!token_ids.ok()) {
       return 0;
     }
@@ -164,7 +165,7 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
       .tokenizer_json = tokenizer_json.empty() ? nullptr : tokenizer_json.c_str(),
       .tokenize_assumes_string = true,
       .tokenize_fn = tokenize_fn,
-      .tokenize_user_data = &tokenizer,
+      .tokenize_user_data = context.get(),
   };
 
   char error_buf[128];
@@ -175,7 +176,8 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
   }
 
   return std::make_unique<LlgConstraintProvider>(
-      std::move(token_lens), std::move(token_bytes), llg_tokenizer, llg_config);
+      std::move(token_lens), std::move(token_bytes), llg_tokenizer, llg_config,
+      std::move(context));
 }
 
 LlgConstraintProvider::~LlgConstraintProvider() {

@@ -270,6 +270,22 @@ TEST(SentencePieceTokenizerTest, ConstraintEncodingPreservesNormalizedCharacters
   }
 }
 
+TEST(SentencePieceTokenizerTest, ConstraintEncodingAvoidsConfiguredStopIDs) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetGemma3TokenizerModelPath()));
+  const std::vector<int> stops = {50, 106};
+  ASSERT_OK_AND_ASSIGN(auto ordinary, tokenizer->TextToTokenIds("<end_of_turn>"));
+  EXPECT_THAT(ordinary, ::testing::ElementsAre(106));
+  for (const auto& text : {"<end_of_turn>", "<unused44>",
+                           "literal <end_of_turn> marker"}) {
+    ASSERT_OK_AND_ASSIGN(auto constrained,
+                        tokenizer->BytesToTokenIdsForConstraint(text, stops));
+    for (int id : constrained) EXPECT_TRUE(id != 50 && id != 106);
+    ASSERT_OK_AND_ASSIGN(auto decoded, tokenizer->TokenIdsToText(constrained));
+    EXPECT_EQ(decoded, text);
+  }
+}
+
 TEST(SentencePieceTokenizerTest, ConstraintEncodingPreservesPartialUnicode) {
   ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
                                            GetGemma3TokenizerModelPath()));

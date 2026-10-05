@@ -649,28 +649,31 @@ TEST_F(LlgFcToolCallsTest, PrimitiveTypes) {
 
       R"(<start_function_call>call:set_timer{duration:10,sound:<escape>true<escape>}<end_function_call><start_function_response>)");
 
+  // A different wire format cannot satisfy this fixture's configured fences.
+  AssertRejects(
+      *constraint,
       R"(<|tool_call>call:set_timer{duration:10,sound:<|"|>true<|"|>}<tool_call|><|tool_response>)");
 
   // Accept other well-formed integers.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:0}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:0}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:-5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:-5}<end_function_call><start_function_response>)");
 
   // Reject floats. "integer" and "number" are distinct JSON Schema types, so
   // a fraction or an exponent must not be permitted here. Consumers that
   // decode into a fixed-width integer reject 10.0 outright.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10.5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10.5}<end_function_call><start_function_response>)");
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10.0}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10.0}<end_function_call><start_function_response>)");
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:1e3}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:1e3}<end_function_call><start_function_response>)");
 }
 
 // Guards the other direction: tightening "integer" must not also tighten
@@ -695,13 +698,13 @@ TEST_F(LlgFcToolCallsTest, NumberParametersStillAcceptFloats) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:21.5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:21.5}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:21}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:21}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:2.15e1}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:2.15e1}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, EnumParameters) {

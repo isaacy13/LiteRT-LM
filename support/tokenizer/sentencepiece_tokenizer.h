@@ -69,7 +69,8 @@ class SentencePieceTokenizer : public Tokenizer {
   ConstraintVocabulary GetConstraintVocabulary() const override;
 
   absl::StatusOr<TokenIds> BytesToTokenIdsForConstraint(
-      absl::string_view bytes) override;
+      absl::string_view bytes,
+      absl::Span<const int> excluded_token_ids = {}) override;
 
   // Returns the size of the vocabulary.
   int GetVocabSize() const override;

@@ -33,6 +33,11 @@ namespace litert::lm {
 using ::litert::support::Tokenizer;
 
 class LlgConstraintProvider : public ConstraintProvider {
+  struct TokenizationContext {
+    Tokenizer& tokenizer;
+    const std::vector<int> special_token_ids;
+  };
+
  public:
   static absl::StatusOr<std::unique_ptr<ConstraintProvider>> Create(
       const Tokenizer& tokenizer, LlGuidanceConfig llg_config);
@@ -41,11 +46,13 @@ class LlgConstraintProvider : public ConstraintProvider {
   explicit LlgConstraintProvider(std::vector<uint32_t>&& token_lens,
                                  std::vector<uint8_t>&& token_bytes,
                                  LlgTokenizer* llg_tokenizer,
-                                 LlGuidanceConfig llg_config)
+                                 LlGuidanceConfig llg_config,
+                                 std::unique_ptr<TokenizationContext> context)
       : token_lens_(std::move(token_lens)),
         token_bytes_(std::move(token_bytes)),
         llg_tokenizer_(std::move(llg_tokenizer)),
-        llg_config_(std::move(llg_config)) {}
+        llg_config_(std::move(llg_config)),
+        tokenization_context_(std::move(context)) {}
 
   ~LlgConstraintProvider() override;
 
@@ -57,6 +64,7 @@ class LlgConstraintProvider : public ConstraintProvider {
   const std::vector<uint8_t> token_bytes_;
   LlgTokenizer* llg_tokenizer_;  // Owned.
   LlGuidanceConfig llg_config_;
+  const std::unique_ptr<TokenizationContext> tokenization_context_;
 };
 
 }  // namespace litert::lm

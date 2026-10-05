@@ -26,7 +26,9 @@ stopping is unchanged and requires separate coverage. Input tokenization is
 declared string-based, allowing LLGuidance's existing invalid UTF8 fallback.
 
 The SentencePiece constraint callback verifies that ordinary model IDs reproduce
-the requested continuation bytes. Faithful encodings retain those IDs. A source
+the requested continuation bytes without using provider-configured control IDs.
+Each provider owns immutable callback metadata for its lifetime; the shared model
+tokenizer is not mutated. Faithful ordinary encodings retain their IDs. A source
 character changed by the normal encoder, a literal control spelling, or partial
 Unicode instead uses the model's native byte pieces. Models lacking the needed
 byte pieces refuse that input. This is tokenizer encoding at a grammar boundary;
@@ -38,7 +40,10 @@ space symbol and Unicode against the normal SentencePiece decoder.
 literal angle brackets, Unicode byte fallback (including a literal SentencePiece
 space symbol), premature controls and stop IDs, explicit special-token tool
 grammar, HF byte-level metadata and invalid IDs. Existing tokenizer and constraint
-tests remain enabled. No model quality result is inferred from those tests.
+tests remain enabled. The pinned upstream FC test had an orphaned assertion
+argument and numeric cases using fences different from its explicit fixture
+options. The assertion call and those fences are corrected; all integer/number
+acceptance and rejection cases remain enabled. No model quality result is inferred from those tests.
 
 The dedicated workflow runs those controls and only then builds the iOS device
 and simulator framework, retaining source identity, binary checksum and logs.
@@ -50,3 +55,12 @@ Provider references:
 - [LLGuidance byte and special-token contract](https://github.com/guidance-ai/llguidance/blob/v1.3.0/docs/special_tokens.md)
 - [LLGuidance native tokenizer JSON decoder](https://github.com/guidance-ai/llguidance/blob/v1.3.0/parser/src/tokenizer_json.rs)
 - [SentencePiece v0.2.2 decoder](https://github.com/google/sentencepiece/blob/v0.2.2/src/sentencepiece_processor.cc)
+
+The first compiled gate at `07f9fa1` failed before executing tests on that
+upstream FC fixture syntax error; its logs are retained and no framework was
+built. Further C ABI probes also found that the current callback treated a
+configured stop's literal spelling as the stop ID. Passing the provider's stop
+metadata to the constraint encoder preserved literal `<end_of_turn>` and
+`<unused44>` text through native masks and normal decoding. These probes use the
+Gemma3 test tokenizer with zero LLM queries; compiled and phone acceptance
+remain required.
