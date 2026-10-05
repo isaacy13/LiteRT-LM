@@ -81,7 +81,8 @@ class ThreadedExecutionManager : public ExecutionManager {
       ::litert::Environment* absl_nullable litert_env,
       std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr,
       std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger =
-          nullptr);
+          nullptr,
+      DecodeInputBufferFactory buffer_factory = nullptr);
 
   ~ThreadedExecutionManager() override;
 
@@ -255,7 +256,8 @@ class ThreadedExecutionManager : public ExecutionManager {
       std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
       ::litert::Environment* absl_nullable litert_env = nullptr,
       std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger =
-          nullptr);
+          nullptr,
+      DecodeInputBufferFactory buffer_factory = nullptr);
 
   // Creates a task with the given task ID, task, dependent tasks, and callback.
   // - session_id: The ID of the session that created the task.

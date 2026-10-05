@@ -138,7 +138,8 @@ class ExecutionManagerTest
   void CreateExecutionManager(
       std::unique_ptr<FakeLlmExecutor> fake_llm_executor,
       std::unique_ptr<AudioExecutorSettings> audio_executor_settings = nullptr,
-      std::unique_ptr<AudioExecutor> audio_executor = nullptr) {
+      std::unique_ptr<AudioExecutor> audio_executor = nullptr,
+      ExecutionManager::DecodeInputBufferFactory buffer_factory = nullptr) {
     // The objects are moved to execution_manager_ so we can't access them
     // after creation.
     if (GetParam() == ExecutionManagerType::kThreaded) {
@@ -150,7 +151,8 @@ class ExecutionManagerTest
               /*llm_executor=*/std::move(fake_llm_executor),
               /*vision_executor_settings=*/nullptr,
               std::move(audio_executor_settings),
-              /*litert_env=*/nullptr, std::move(audio_executor)));
+              /*litert_env=*/nullptr, std::move(audio_executor),
+              /*runtime_debugger=*/nullptr, std::move(buffer_factory)));
     } else {
       ASSERT_OK_AND_ASSIGN(
           execution_manager_,
@@ -160,7 +162,8 @@ class ExecutionManagerTest
               /*llm_executor=*/std::move(fake_llm_executor),
               /*vision_executor_settings=*/nullptr,
               std::move(audio_executor_settings),
-              /*litert_env=*/nullptr, std::move(audio_executor)));
+              /*litert_env=*/nullptr, std::move(audio_executor),
+              /*runtime_debugger=*/nullptr, std::move(buffer_factory)));
     }
   }
 
@@ -425,6 +428,82 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithInternalSampler) {
                           TaskState::kProcessing, TaskState::kDone));
 
   EXPECT_THAT(responses_texts, ElementsAre("4", "5"));
+}
+
+TEST_P(ExecutionManagerTest, DecodeBufferAllocationFailureFinishesAndAllowsFreshSession) {
+  auto allocations = std::make_shared<std::atomic<int>>(0);
+  ExecutionManager::DecodeInputBufferFactory buffer_factory =
+      [allocations](absl::Span<const int> ids)
+          -> absl::StatusOr<::litert::TensorBuffer> {
+    if (allocations->fetch_add(1) == 0) {
+      return absl::ResourceExhaustedError("Injected decoded-ID allocation failure");
+    }
+    return ExecutionManager::AllocateDecodeInputBuffer(ids);
+  };
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(), nullptr, nullptr,
+                         std::move(buffer_factory));
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig(
+                                                /*use_external_sampler=*/true));
+
+  // The failed task must release active-task/executor ownership before a fresh
+  // session exercises the normal native allocator on this same manager.
+  for (bool should_fail : {true, false}) {
+    ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                         execution_manager_->RegisterNewSession(session_config));
+    ASSERT_OK_AND_ASSIGN(auto input_text,
+                         tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
+    std::vector<InputData> inputs;
+    inputs.push_back(InputText(std::move(input_text)));
+    ASSERT_OK_AND_ASSIGN(const TaskId prefill_task_id,
+                         execution_manager_->GetNewTaskId());
+    ASSERT_OK(execution_manager_->AddPrefillTask(
+        session_id, prefill_task_id, std::move(inputs),
+        /*dependency_task_ids=*/{},
+        /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+        /*callback=*/[](absl::StatusOr<Responses> responses) {
+          EXPECT_OK(responses);
+        }));
+    ASSERT_OK(execution_manager_->WaitUntilDone(prefill_task_id, absl::Seconds(3)));
+
+    int error_callbacks = 0;
+    int successful_terminal_callbacks = 0;
+    std::vector<std::string> texts;
+    ASSERT_OK_AND_ASSIGN(const TaskId decode_task_id,
+                         execution_manager_->GetNewTaskId());
+    ASSERT_OK(execution_manager_->AddDecodeTask(
+        session_id, decode_task_id, /*dependency_task_ids=*/{},
+        RepetitionPenaltyConfig::Default(), NoRepeatNgramConfig::Default(),
+        SuppressTokensConfig::Default(), /*constraint=*/nullptr,
+        /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+        [should_fail, &error_callbacks, &successful_terminal_callbacks, &texts](
+            absl::StatusOr<Responses> responses) {
+          if (!responses.ok()) {
+            ++error_callbacks;
+            EXPECT_TRUE(should_fail);
+            EXPECT_EQ(responses.status().code(), absl::StatusCode::kResourceExhausted);
+            EXPECT_EQ(responses.status().message(), "Injected decoded-ID allocation failure");
+            return;
+          }
+          if (IsTaskEndState(responses->GetTaskState())) {
+            ++successful_terminal_callbacks;
+          }
+          if (!responses->GetTexts().empty()) {
+            texts.push_back(responses->GetTexts()[0]);
+          }
+        }));
+    EXPECT_OK(execution_manager_->WaitUntilDone(decode_task_id, absl::Seconds(1)));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::Seconds(1)));
+    ASSERT_OK(execution_manager_->WaitUntilAllDone(absl::Seconds(1)));
+    EXPECT_EQ(error_callbacks, should_fail ? 1 : 0);
+    EXPECT_EQ(successful_terminal_callbacks, should_fail ? 0 : 1);
+    if (should_fail) {
+      EXPECT_TRUE(texts.empty());
+    } else {
+      EXPECT_THAT(texts, ElementsAre("4", "5"));
+    }
+    EXPECT_OK(execution_manager_->ReleaseSession(session_id));
+  }
+  EXPECT_EQ(allocations->load(), 2);
 }
 
 TEST_P(ExecutionManagerTest, AddDecodeTaskWithExternalSampler) {

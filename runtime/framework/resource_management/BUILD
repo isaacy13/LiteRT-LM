@@ -26,6 +26,7 @@ licenses(["notice"])
 
 cc_library(
     name = "execution_manager",
+    srcs = ["execution_manager.cc"],
     hdrs = ["execution_manager.h"],
     deps = [
         "@com_google_absl//absl/base:nullability",
@@ -35,6 +36,8 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_tensor_buffer",
         "//runtime/components:sampler",
         "//runtime/components:stop_token_detector",
         "//runtime/components/constrained_decoding:constraint",
@@ -44,6 +47,7 @@ cc_library(
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/framework/resource_management/context_handler",
+        "//runtime/util:convert_tensor_buffer",
     ],
 )
 

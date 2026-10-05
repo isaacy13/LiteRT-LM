@@ -88,8 +88,10 @@ SerialExecutionManager::SerialExecutionManager(
     Tokenizer* absl_nonnull tokenizer,
     std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
     ::litert::Environment* absl_nullable litert_env,
-    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger)
-    : tokenizer_(tokenizer),
+    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger,
+    DecodeInputBufferFactory buffer_factory)
+    : ExecutionManager(std::move(buffer_factory)),
+      tokenizer_(tokenizer),
       resource_manager_(std::move(resource_manager)),
       litert_env_(litert_env),
       runtime_debugger_(std::move(runtime_debugger)) {}
@@ -109,7 +111,8 @@ SerialExecutionManager::Create(
     audio_executor_settings,
     ::litert::Environment* absl_nullable litert_env,
     std::unique_ptr<AudioExecutor> absl_nullable audio_executor,
-    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger) {
+    std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger,
+    DecodeInputBufferFactory buffer_factory) {
   ABSL_ASSIGN_OR_RETURN(
       auto resource_manager,
       ResourceManager::Create(model_resources, std::move(llm_executor),
@@ -118,7 +121,7 @@ SerialExecutionManager::Create(
                               std::move(audio_executor)));
   return absl::WrapUnique(new SerialExecutionManager(
       tokenizer, std::move(resource_manager), litert_env,
-      std::move(runtime_debugger)));
+      std::move(runtime_debugger), std::move(buffer_factory)));
 }
 
 absl::Status SerialExecutionManager::WaitUntilDone(TaskId task_id,
@@ -923,15 +926,16 @@ absl::Status SerialExecutionManager::AddDecodeTask(
         std::vector<int> decoded_ids(num_output_candidates,
                                      session_info->last_prefill_token_id);
         auto decoded_ids_buffer_or =
-            CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
-        if (!decoded_ids_buffer_or.HasValue()) {
+            CreateDecodeInputBuffer(decoded_ids);
+        if (!decoded_ids_buffer_or.ok()) {
+          llm_executor.value().reset();
           FinishTaskAndLogErrors(
               task_id,
-              absl::InternalError(decoded_ids_buffer_or.Error().Message()),
+              decoded_ids_buffer_or.status(),
               std::move(callback));
           return;
         }
-        decoded_ids_buffer = std::move(decoded_ids_buffer_or.Value());
+        decoded_ids_buffer = std::move(decoded_ids_buffer_or.value());
       }
 
 #if defined(LITERT_LM_DEBUGGER_ENABLED)
@@ -1103,10 +1107,11 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
     std::vector<int> decoded_ids(num_output_candidates,
                                  session_info->last_prefill_token_id);
     auto decoded_ids_buffer =
-        CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
-    if (!decoded_ids_buffer.HasValue()) {
+        CreateDecodeInputBuffer(decoded_ids);
+    if (!decoded_ids_buffer.ok()) {
+      llm_executor.value().reset();
       FinishTaskAndLogErrors(
-          task_id, absl::InternalError(decoded_ids_buffer.Error().Message()),
+          task_id, decoded_ids_buffer.status(),
           std::move(callback));
       return;
     }
@@ -1120,7 +1125,7 @@ absl::Status SerialExecutionManager::AddTextScoringTask(
     auto temperature = 1.0f;
     auto responses = Tasks::Score(
         *llm_executor.value(), *tokenizer_, target_text_views, temperature,
-        std::move(decoded_ids_buffer.Value()), store_token_lengths);
+        std::move(decoded_ids_buffer.value()), store_token_lengths);
 
     if (cancelled != nullptr && cancelled->load()) {
       responses = Responses(TaskState::kCancelled);

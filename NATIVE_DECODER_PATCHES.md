@@ -29,7 +29,7 @@ must pass those device checks before adopting the fork's binary.
 
 ## Retained validation
 
-`native-byte-contract.yml` runs eight tokenizer and constraint targets, then
+`native-byte-contract.yml` runs nine tokenizer, constraint and execution-manager targets, then
 builds device and simulator framework slices. Host XML and logs are copied before
 switching Bazel configurations: `bazel-testlogs` otherwise points at the later
 iOS configuration. Evidence is uploaded even when a later step fails.
@@ -89,3 +89,21 @@ package acceptance. The first local probe's import failure and second probe's
 incorrect byte-equality assumption are retained separately. A producer control
 checks that linkage rewriting never strips signatures and still rewrites every
 required dependency. The next complete SDK gate remains required before adoption.
+
+## Allocation errors finish their native task
+
+The external-sampler decoded-ID allocation error previously called the threaded
+callback directly and returned without the native task finalizer. That could
+leave an active task after the worker exited, delaying session completion.
+The error now releases the executor and uses the existing finalizer, which owns
+terminal callback delivery, dependent-task failure and active-task removal.
+
+Serial and threaded managers share one decoded-ID allocation policy. Production
+uses the same managed tensor-buffer allocation and shape; a per-manager injected
+allocator permits deterministic allocation-failure coverage without global state
+or real memory exhaustion. The new native regression runs for both managers,
+requires exactly one error, bounded task/session/pool completion, explicit release,
+and a fresh successful session on the same manager with the real allocator.
+The full existing execution-manager suite is added to the host gate. Compilation
+and execution remain pending; this source change does not establish phone OOM,
+cancellation, memory, performance or SDK/package acceptance.
