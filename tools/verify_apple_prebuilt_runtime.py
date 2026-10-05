@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reject missing LFS objects and incompatible Apple runtime binaries early."""
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -28,6 +29,13 @@ def verify() -> list[dict[str, str]]:
             with path.open("rb") as binary:
                 if binary.read(128).startswith(b"version https://git-lfs.github.com/spec/"):
                     raise RuntimeError(f"Unfetched LFS binary: {path}")
+            pointer = output("git", "-C", str(ROOT), "show", f"HEAD:prebuilt/{directory}/{name}")
+            expected_digest = next((line.removeprefix("oid sha256:") for line in pointer.splitlines()
+                                    if line.startswith("oid sha256:")), None)
+            with path.open("rb") as binary:
+                actual_digest = hashlib.file_digest(binary, "sha256").hexdigest()
+            if expected_digest is None or actual_digest != expected_digest:
+                raise RuntimeError(f"Pinned LFS content differs at {path}")
             architectures = output("lipo", "-archs", str(path)).split()
             if architectures != ["arm64"]:
                 raise RuntimeError(f"Expected arm64 at {path}; got {architectures}")

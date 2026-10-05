@@ -34,6 +34,8 @@ jobs:
           chmod +x "$RUNNER_TEMP/bazelisk"
       - name: Verify pinned Apple runtime slices
         run: python3 tools/verify_apple_prebuilt_runtime.py
+      - name: Package closure rejection controls
+        run: python3 tools/package_apple_runtime_test.py
       - name: Native tokenizer and constraint regressions
         run: |
           set -o pipefail
@@ -61,10 +63,11 @@ jobs:
           "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             //swift:CLiteRTLM 2>&1 | tee native-framework.log
-          mkdir native-artifact
-          cp bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact/
-          shasum -a 256 native-artifact/CLiteRTLM.xcframework.zip > native-artifact/SHA256SUMS
-          git rev-parse HEAD > native-artifact/SOURCE_COMMIT
+      - name: Package and verify the Apple runtime dependency graph
+        run: |
+          set -o pipefail
+          python3 tools/package_apple_runtime.py bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact \
+            2>&1 | tee native-package.log
       - name: Retain native evidence and framework
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -73,6 +76,7 @@ jobs:
           path: |
             native-tests.log
             native-framework.log
+            native-package.log
             native-artifact/
             native-test-results/
           if-no-files-found: warn

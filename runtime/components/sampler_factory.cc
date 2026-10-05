@@ -21,6 +21,10 @@
 #include <random>
 #include <utility>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
@@ -162,6 +166,28 @@ extern "C" int (*LiteRtTopKMetalSampler_SetInferenceFuncAndInputTensors_Static)(
     LiteRtTensorBuffer absl_nullable mask_tensor,
     LiteRtTensorBuffer absl_nullable prev_param_tensor,
     LiteRtTensorBuffer absl_nullable param_tensor, char** error_msg) = nullptr;
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS embeds these APIs as a declared framework dependency. Bind them through
+// the linker instead of searching for standalone dylibs at runtime.
+extern "C" int LiteRtTopKMetalSampler_Create(
+    const struct LiteRtRuntimeCApiStruct*, LiteRtEnvironment, int, int, int,
+    const LiteRtTopKSampler_ActivationDataType*,
+    const LiteRtTopKSampler_SamplerParameters*, LiteRtTopKSampler_Sampler**, char**);
+extern "C" void LiteRtTopKMetalSampler_Destroy(LiteRtTopKSampler_Sampler*);
+extern "C" int LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer(
+    LiteRtTopKSampler_Sampler*, LiteRtTensorBuffer, LiteRtTensorBuffer,
+    const LiteRtTensorBuffer*, char**);
+extern "C" int LiteRtTopKMetalSampler_UpdateConfig(
+    LiteRtTopKSampler_Sampler*, const LiteRtTopKSampler_SamplerParameters*,
+    int, void*, char**);
+extern "C" int LiteRtTopKMetalSampler_CanHandleInput(LiteRtTopKSampler_Sampler*);
+extern "C" int LiteRtTopKMetalSampler_HandlesInput(LiteRtTopKSampler_Sampler*);
+extern "C" int LiteRtTopKMetalSampler_SetInferenceFuncAndInputTensors(
+    LiteRtTopKSampler_Sampler*, int (*)(void*), void*, LiteRtTensorBuffer,
+    LiteRtTensorBuffer, LiteRtTensorBuffer, LiteRtTensorBuffer, LiteRtTensorBuffer,
+    LiteRtTensorBuffer, LiteRtTensorBuffer, char**);
+#endif
 
 absl::Status CreateStatus(int error_code, const char* error_msg) {
   absl::StatusCode code = static_cast<absl::StatusCode>(error_code);
@@ -548,6 +574,16 @@ class TopKMetalCApiSampler : public TopKCApiSampler {
       const litert::Environment& env, int batch_size, int sequence_size,
       int vocab_size, std::optional<ActivationDataType> activation_data_type,
       proto::SamplerParameters sampler_params) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    auto capi = std::make_unique<TopKSamplerCApi>(
+        /*lib=*/std::nullopt, LiteRtTopKMetalSampler_Create,
+        LiteRtTopKMetalSampler_Destroy,
+        LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer,
+        LiteRtTopKMetalSampler_UpdateConfig,
+        LiteRtTopKMetalSampler_CanHandleInput,
+        LiteRtTopKMetalSampler_HandlesInput,
+        LiteRtTopKMetalSampler_SetInferenceFuncAndInputTensors);
+#else
     std::unique_ptr<TopKSamplerCApi> capi;
     // Metal is only supported on Apple platforms (macOS/iOS/tvOS/watchOS).
     // The shared library validation will handle platform checks implicitly,
@@ -577,6 +613,8 @@ class TopKMetalCApiSampler : public TopKCApiSampler {
       capi = std::move(static_capi_or.value());
       ABSL_VLOG(1) << "Statically linked LiteRtTopKMetalSampler C API.";
     }
+
+#endif
 
     LiteRtTopKSampler_Sampler* sampler = nullptr;
     char* error_msg = nullptr;
