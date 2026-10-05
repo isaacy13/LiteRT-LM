@@ -137,7 +137,7 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     token_bytes.insert(token_bytes.end(), token.begin(), token.end());
   }
 
-  auto context = std::make_unique<TokenizationContext>(TokenizationContext{
+  auto context = std::make_shared<const TokenizationContext>(TokenizationContext{
       const_cast<Tokenizer&>(tokenizer), vocabulary.special_token_ids});
   auto tokenize_fn = [](const void* user_data, const uint8_t* bytes,
                         size_t bytes_len, uint32_t* output_tokens,
@@ -206,7 +206,8 @@ LlgConstraintProvider::CreateConstraint(ConstraintArg constraint_arg) const {
 
   return std::make_unique<LlgConstraint>(llg_constraint,
                                          static_cast<int>(token_lens_.size()),
-                                         *llg_config_.eos_id);
+                                         *llg_config_.eos_id,
+                                         tokenization_context_);
 }
 
 }  // namespace litert::lm

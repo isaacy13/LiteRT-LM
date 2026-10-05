@@ -443,6 +443,7 @@ cc_test(
         ":bitmap",
         ":constraint",
         ":constraint_provider",
+        ":llg_constraint",
         ":llg_constraint_config",
         ":llg_constraint_provider",
         ":logit_mask",

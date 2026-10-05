@@ -47,7 +47,7 @@ class LlgConstraintProvider : public ConstraintProvider {
                                  std::vector<uint8_t>&& token_bytes,
                                  LlgTokenizer* llg_tokenizer,
                                  LlGuidanceConfig llg_config,
-                                 std::unique_ptr<TokenizationContext> context)
+                                 std::shared_ptr<const TokenizationContext> context)
       : token_lens_(std::move(token_lens)),
         token_bytes_(std::move(token_bytes)),
         llg_tokenizer_(std::move(llg_tokenizer)),
@@ -64,7 +64,7 @@ class LlgConstraintProvider : public ConstraintProvider {
   const std::vector<uint8_t> token_bytes_;
   LlgTokenizer* llg_tokenizer_;  // Owned.
   LlGuidanceConfig llg_config_;
-  const std::unique_ptr<TokenizationContext> tokenization_context_;
+  const std::shared_ptr<const TokenizationContext> tokenization_context_;
 };
 
 }  // namespace litert::lm

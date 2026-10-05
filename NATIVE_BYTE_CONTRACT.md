@@ -27,7 +27,7 @@ declared string-based, allowing LLGuidance's existing invalid UTF8 fallback.
 
 The SentencePiece constraint callback verifies that ordinary model IDs reproduce
 the requested continuation bytes without using provider-configured control IDs.
-Each provider owns immutable callback metadata for its lifetime; the shared model
+Providers, constraints and every cloned state retain immutable callback metadata; the shared model
 tokenizer is not mutated. Faithful ordinary encodings retain their IDs. A source
 character changed by the normal encoder, a literal control spelling, or partial
 Unicode instead uses the model's native byte pieces. Models lacking the needed
@@ -64,3 +64,12 @@ metadata to the constraint encoder preserved literal `<end_of_turn>` and
 `<unused44>` text through native masks and normal decoding. These probes use the
 Gemma3 test tokenizer with zero LLM queries; compiled and phone acceptance
 remain required.
+
+Review of `CreateRegexConstraint` found that an existing SDK helper destroys
+its local provider before using the returned constraint. Candidate `59d676a`
+was stopped during compilation after this ownership bug was identified; its
+logs are retained and it establishes no compiled acceptance. The callback
+context now has shared ownership through the provider, native constraint
+owner and cloned states. Tests cover native mask generation after provider
+destruction and deterministic weak ownership through the last copied state.
+The underlying model tokenizer retains its existing engine-owned lifetime.

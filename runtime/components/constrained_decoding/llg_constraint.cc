@@ -66,7 +66,8 @@ std::vector<bool> SampleMaskToVector(const uint32_t* sample_mask,
 std::unique_ptr<Constraint::State> LlgConstraint::Start() const {
   ::LlgConstraint* llg_constraint =
       llg_clone_constraint(llg_constraint_owner_.llg_constraint());
-  return std::make_unique<LlgConstraint::LlgState>(llg_constraint);
+  return std::make_unique<LlgConstraint::LlgState>(
+      llg_constraint, llg_constraint_owner_.tokenization_context());
 }
 
 bool LlgConstraint::IsEnded(const LlgConstraint::State& state) const {

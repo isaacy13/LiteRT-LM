@@ -37,7 +37,7 @@ jobs:
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
-            --test_output=all \
+            --test_output=all --keep_going --verbose_failures \
             //support/tokenizer:sentencepiece_tokenizer_test \
             //support/tokenizer:huggingface_tokenizer_test \
             //runtime/components/constrained_decoding:constraint_vocabulary_test \

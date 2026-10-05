@@ -143,6 +143,18 @@ TEST(ConstraintVocabularyTest, LiteralStopSpellingsUseTextInsteadOfControlIDs) {
   }
 }
 
+TEST(ConstraintVocabularyTest, ConstraintRetainsCallbackAfterProviderDestruction) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer,
+                      SentencePieceTokenizer::CreateFromFile(GemmaTokenizerPath()));
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateConstraintProvider(
+      LlGuidanceConfig{.eos_id = 1}, *tokenizer, {{1}, {106}}));
+  ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
+      LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kJsonSchema,
+          .constraint_string = R"({"type":"string","enum":["<end_of_turn>"]})"}));
+  provider.reset();
+  SampleAndCheckNativeText(*constraint, *tokenizer, "\"<end_of_turn>\"", 1);
+}
+
 TEST(ConstraintVocabularyTest, EverySingleTokenStopIsBlockedInOpenJSON) {
   MockTokenizer tokenizer;
   ConstraintVocabulary vocabulary{

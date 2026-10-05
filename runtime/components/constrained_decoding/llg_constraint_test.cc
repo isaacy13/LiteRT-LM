@@ -26,6 +26,7 @@
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
+#include "runtime/components/constrained_decoding/llg_constraint.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
 #include "runtime/components/constrained_decoding/logit_mask.h"
@@ -87,6 +88,30 @@ TEST_F(LlgConstraintTest, GetVocabularySize) {
                            .constraint_type = LlgConstraintType::kRegex,
                            .constraint_string = "a+"}));
   EXPECT_EQ(constraint->GetVocabularySize(), 5);
+}
+
+TEST_F(LlgConstraintTest, ClonedStatesRetainCallbackContextUntilLastOwner) {
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateProvider());
+  ASSERT_OK_AND_ASSIGN(auto original, provider->CreateConstraint(
+      LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kRegex,
+                             .constraint_string = "a+"}));
+  auto original_state = original->Start();
+  auto* native = static_cast<LlgConstraint::LlgState*>(original_state.get());
+  auto context = std::make_shared<int>(42);
+  std::weak_ptr<const void> lifetime = context;
+  auto constraint = std::make_unique<LlgConstraint>(
+      llg_clone_constraint(native->llg_constraint()), 5, 1, context);
+  context.reset();
+  auto state = constraint->Start();
+  auto copy = std::make_unique<LlgConstraint::LlgState>(
+      *static_cast<LlgConstraint::LlgState*>(state.get()));
+  constraint.reset();
+  state.reset();
+  EXPECT_FALSE(lifetime.expired());
+  LlgMaskResult mask;
+  EXPECT_EQ(llg_compute_mask(copy->llg_constraint(), &mask), 0);
+  copy.reset();
+  EXPECT_TRUE(lifetime.expired());
 }
 
 TEST_F(LlgConstraintTest, ComputeBitmap) {
