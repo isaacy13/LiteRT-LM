@@ -95,15 +95,31 @@ TEST(ConstraintVocabularyTest, ByteFallbackPreservesLiteralSpaceSymbol) {
   ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
       LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kJsonSchema,
                              .constraint_string = R"({"type":"string","enum":["▁🧭"]})"}));
-  ASSERT_OK_AND_ASSIGN(auto quote, tokenizer->TokenToId("\""));
-  std::vector<int> tokens{quote};
-  for (const auto& piece : {"<0xE2>", "<0x96>", "<0x81>", "<0xF0>",
-                            "<0x9F>", "<0xA7>", "<0xAD>"}) {
-    ASSERT_OK_AND_ASSIGN(auto id, tokenizer->TokenToId(piece));
-    tokens.push_back(id);
+  auto state = constraint->Start();
+  std::vector<int> tokens;
+  bool completed = false;
+  for (int step = 0; step < 64; ++step) {
+    ASSERT_OK_AND_ASSIGN(auto mask, constraint->ComputeMask(*state));
+    ASSERT_EQ(mask->GetType(), MaskType::kBitmap);
+    const auto& bitmap = static_cast<const BitmapLogitMask&>(*mask);
+    if (bitmap.IsAllowed(1)) {
+      completed = true;
+      break;
+    }
+    int selected = -1;
+    for (int id = 0; id < constraint->GetVocabularySize(); ++id) {
+      if (bitmap.IsAllowed(id)) {
+        selected = id;
+        break;
+      }
+    }
+    ASSERT_GE(selected, 0);
+    ASSERT_OK_AND_ASSIGN(state, constraint->ComputeNext(*state, selected));
+    tokens.push_back(selected);
   }
-  tokens.push_back(quote);
-  ConsumeAndCheckEOS(*constraint, tokens, 1);
+  EXPECT_TRUE(completed);
+  ASSERT_OK_AND_ASSIGN(auto output, tokenizer->TokenIdsToText(tokens));
+  EXPECT_EQ(output, "\"▁🧭\"");
 }
 
 TEST(ConstraintVocabularyTest, EverySingleTokenStopIsBlockedInOpenJSON) {

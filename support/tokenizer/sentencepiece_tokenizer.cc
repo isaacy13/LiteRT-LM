@@ -31,6 +31,37 @@
 #include "sentencepiece_processor.h"  // from @sentencepiece
 
 namespace litert::support {
+namespace {
+
+bool IsConstraintControl(const sentencepiece::SentencePieceProcessor& processor,
+                         int id) {
+  return processor.IsControl(id) || processor.IsUnknown(id) ||
+         processor.IsUnused(id);
+}
+
+std::string ConstraintTokenBytes(
+    const sentencepiece::SentencePieceProcessor& processor, int id) {
+  const std::string& piece = processor.IdToPiece(id);
+  if (processor.IsByte(id)) {
+    return std::string(1, static_cast<char>(sentencepiece::PieceToByte(piece)));
+  }
+  if (IsConstraintControl(processor, id)) return piece;
+  return absl::StrReplaceAll(piece, {{"\xe2\x96\x81", " "}});
+}
+
+}  // namespace
+
+SentencePieceTokenizer::SentencePieceTokenizer(
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> processor)
+    : processor_(std::move(processor)), vocab_size_(processor_->GetPieceSize()) {
+  byte_token_ids_.fill(-1);
+  for (int id = 0; id < vocab_size_; ++id) {
+    if (processor_->IsByte(id)) {
+      int byte = sentencepiece::PieceToByte(processor_->IdToPiece(id));
+      if (byte >= 0 && byte < byte_token_ids_.size()) byte_token_ids_[byte] = id;
+    }
+  }
+}
 
 absl::StatusOr<std::unique_ptr<SentencePieceTokenizer>>
 SentencePieceTokenizer::CreateFromFile(absl::string_view model_path) {
@@ -128,22 +159,44 @@ ConstraintVocabulary SentencePieceTokenizer::GetConstraintVocabulary() const {
   ConstraintVocabulary vocabulary;
   vocabulary.token_bytes.reserve(vocab_size_);
   for (int id = 0; id < vocab_size_; ++id) {
-    const std::string& piece = processor_->IdToPiece(id);
-    if (processor_->IsControl(id) || processor_->IsUnknown(id) ||
-        processor_->IsUnused(id)) {
-      vocabulary.token_bytes.push_back(piece);
+    vocabulary.token_bytes.push_back(ConstraintTokenBytes(*processor_, id));
+    if (IsConstraintControl(*processor_, id)) {
       vocabulary.special_token_ids.push_back(id);
-    } else if (processor_->IsByte(id)) {
-      vocabulary.token_bytes.emplace_back(
-          1, static_cast<char>(sentencepiece::PieceToByte(piece)));
-    } else {
-      // Isolated Decode strips the BOS prefix and replaces incomplete bytes.
-      // Constraints instead need the decoder's continuation byte mapping.
-      vocabulary.token_bytes.push_back(
-          absl::StrReplaceAll(piece, {{"\xe2\x96\x81", " "}}));
     }
   }
   return vocabulary;
+}
+
+absl::StatusOr<TokenIds> SentencePieceTokenizer::BytesToTokenIdsForConstraint(
+    absl::string_view bytes) {
+  auto encoded = TextToTokenIds(bytes);
+  if (encoded.ok()) {
+    std::string reconstructed;
+    reconstructed.reserve(bytes.size());
+    bool ordinary = true;
+    for (int id : *encoded) {
+      if (IsConstraintControl(*processor_, id)) {
+        ordinary = false;
+        break;
+      }
+      reconstructed += ConstraintTokenBytes(*processor_, id);
+    }
+    if (ordinary && reconstructed == bytes) return encoded;
+  }
+  // Byte pieces preserve source characters the normal encoder would change,
+  // as well as partial UTF8 at grammar boundaries. Faithful ordinary encodings
+  // retain their original model IDs.
+  TokenIds exact;
+  exact.reserve(bytes.size());
+  for (unsigned char byte : bytes) {
+    int id = byte_token_ids_[byte];
+    if (id < 0) {
+      return absl::InvalidArgumentError(
+          "SentencePiece cannot encode constraint bytes faithfully.");
+    }
+    exact.push_back(id);
+  }
+  return exact;
 }
 
 }  // namespace litert::support

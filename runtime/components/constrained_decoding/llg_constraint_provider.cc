@@ -145,7 +145,7 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     // cast back into a Tokenizer*.
     Tokenizer* tokenizer =
         static_cast<Tokenizer*>(const_cast<void*>(user_data));
-    auto token_ids = tokenizer->TextToTokenIds(text);
+    auto token_ids = tokenizer->BytesToTokenIdsForConstraint(text);
     if (!token_ids.ok()) {
       return 0;
     }

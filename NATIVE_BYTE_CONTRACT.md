@@ -25,6 +25,15 @@ tokens because globally banning them could prevent valid text. Sequence-aware
 stopping is unchanged and requires separate coverage. Input tokenization is
 declared string-based, allowing LLGuidance's existing invalid UTF8 fallback.
 
+The SentencePiece constraint callback verifies that ordinary model IDs reproduce
+the requested continuation bytes. Faithful encodings retain those IDs. A source
+character changed by the normal encoder, a literal control spelling, or partial
+Unicode instead uses the model's native byte pieces. Models lacking the needed
+byte pieces refuse that input. This is tokenizer encoding at a grammar boundary;
+generated replies are neither transformed nor repaired. Direct C ABI probes retain
+the original failures and validate native mask-driven generation of a literal
+space symbol and Unicode against the normal SentencePiece decoder.
+
 `constraint_vocabulary_test` checks exact string enums with spaces and Unicode,
 literal angle brackets, Unicode byte fallback (including a literal SentencePiece
 space symbol), premature controls and stop IDs, explicit special-token tool

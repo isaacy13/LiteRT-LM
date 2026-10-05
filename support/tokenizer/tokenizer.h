@@ -95,6 +95,12 @@ class Tokenizer {
     return ConstraintVocabulary{.token_bytes = GetTokens()};
   }
 
+  // Preserve requested bytes without BOS insertion or source normalization.
+  virtual absl::StatusOr<TokenIds> BytesToTokenIdsForConstraint(
+      absl::string_view bytes) {
+    return TextToTokenIds(bytes);
+  }
+
   // Returns the size of the vocabulary.
   virtual int GetVocabSize() const = 0;
 
