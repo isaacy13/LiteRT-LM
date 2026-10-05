@@ -107,3 +107,13 @@ and a fresh successful session on the same manager with the real allocator.
 The full existing execution-manager suite is added to the host gate. Compilation
 and execution remain pending; this source change does not establish phone OOM,
 cancellation, memory, performance or SDK/package acceptance.
+
+The full execution-manager target previously skipped three serial variants. Its
+serial waits drive queued work and cannot interrupt an already running decode;
+the timeout controls now require the delayed task to finish, the caller to wait
+for the actual configured delay, and zero-time task/session/pool checks to succeed.
+Threaded variants retain their original exact timeout assertions. The destructor
+control runs its original pending-work/completed-callback check for both managers.
+No skipped cases are accepted. The first owned 6c8706d gate was canceled after this
+coverage issue was identified; its partial logs/results are retained, not treated
+as a native test or SDK acceptance result.

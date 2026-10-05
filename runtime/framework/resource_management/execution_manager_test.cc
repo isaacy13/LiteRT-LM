@@ -30,6 +30,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
@@ -662,13 +663,6 @@ TEST_P(ExecutionManagerTest, CreateTaskWithInvalidDependencyId) {
 }
 
 TEST_P(ExecutionManagerTest, WaitUntilTaskDoneTimeout) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    // Serial execution is synchronous, so it won't timeout unless the task
-    // itself takes longer than the timeout and we have some way to interrupt.
-    // But currently AddDecodeTask will block until done.
-    // So this test is only meaningful for Threaded.
-    GTEST_SKIP() << "Skipping timeout test for SerialExecutionManager";
-  }
   auto prefill_tokens = std::vector<std::vector<int>>{};
   auto decode_tokens = std::vector<std::vector<int>>{};
   decode_tokens.push_back({4});
@@ -699,19 +693,26 @@ TEST_P(ExecutionManagerTest, WaitUntilTaskDoneTimeout) {
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
 
-  EXPECT_EQ(
-      execution_manager_->WaitUntilDone(task_id, absl::Milliseconds(100)),
-      absl::DeadlineExceededError(absl::StrCat(
-          "Task ", task_id, " did not complete within the timeout of 100ms.")));
+  const auto wait_started = absl::Now();
+  const auto wait_status =
+      execution_manager_->WaitUntilDone(task_id, absl::Milliseconds(100));
+  if (GetParam() == ExecutionManagerType::kSerial) {
+    // Serial waits drive queued execution and cannot interrupt a running decode.
+    // The completed task wins after that decode; zero-time waits then succeed.
+    EXPECT_OK(wait_status);
+    EXPECT_GE(absl::Now() - wait_started, absl::Milliseconds(500));
+    EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::ZeroDuration()));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::ZeroDuration()));
+  } else {
+    EXPECT_EQ(wait_status, absl::DeadlineExceededError(absl::StrCat(
+        "Task ", task_id, " did not complete within the timeout of 100ms.")));
+  }
 
   // Wait for the task to actually finish to avoid use after free.
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
 }
 
 TEST_P(ExecutionManagerTest, WaitUntilAllDoneTimeout) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    GTEST_SKIP() << "Skipping timeout test for SerialExecutionManager";
-  }
   auto prefill_tokens = std::vector<std::vector<int>>{};
   auto decode_tokens = std::vector<std::vector<int>>{};
   decode_tokens.push_back({4});
@@ -742,9 +743,17 @@ TEST_P(ExecutionManagerTest, WaitUntilAllDoneTimeout) {
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
 
-  EXPECT_EQ(
-      execution_manager_->WaitUntilAllDone(absl::Milliseconds(100)).code(),
-      absl::StatusCode::kDeadlineExceeded);
+  const auto wait_started = absl::Now();
+  const auto wait_status =
+      execution_manager_->WaitUntilAllDone(absl::Milliseconds(100));
+  if (GetParam() == ExecutionManagerType::kSerial) {
+    EXPECT_OK(wait_status);
+    EXPECT_GE(absl::Now() - wait_started, absl::Milliseconds(500));
+    EXPECT_OK(execution_manager_->WaitUntilAllDone(absl::ZeroDuration()));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::ZeroDuration()));
+  } else {
+    EXPECT_EQ(wait_status.code(), absl::StatusCode::kDeadlineExceeded);
+  }
 
   // Wait for the task to actually finish to avoid use after free.
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
@@ -1464,9 +1473,6 @@ TEST_P(ExecutionManagerTest, SetCurrentStep) {
 }
 
 TEST_P(ExecutionManagerTest, DestructorWaitsForActiveTasks) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    GTEST_SKIP() << "Skipping for SerialExecutionManager as it is synchronous";
-  }
   auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
   fake_llm_executor->SetDecodeDelay(absl::Milliseconds(500));
   CreateExecutionManager(std::move(fake_llm_executor));
