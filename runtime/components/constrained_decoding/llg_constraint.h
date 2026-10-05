@@ -79,6 +79,10 @@ class LlgConstraint : public Constraint {
       return llg_constraint_owner_->llg_constraint();
     }
 
+    const std::shared_ptr<const void>& tokenization_context() const {
+      return llg_constraint_owner_->tokenization_context();
+    }
+
    private:
     // The shared_ptr is needed because Constraint::State must be copyable.
     std::shared_ptr<LlgConstraintOwner> llg_constraint_owner_;

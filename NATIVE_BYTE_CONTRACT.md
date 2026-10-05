@@ -73,3 +73,14 @@ context now has shared ownership through the provider, native constraint
 owner and cloned states. Tests cover native mask generation after provider
 destruction and deterministic weak ownership through the last copied state.
 The underlying model tokenizer retains its existing engine-owned lifetime.
+
+The native regressions at `38c87d6` passed all eight selected targets. Its
+framework build was stopped after source review found a separate state-sharing
+bug: `ComputeNext` advanced the input parser while MTP retained that position
+and every drafted position for verification. The corrected transition clones
+the native parser before committing, retaining its callback metadata. New tests
+verify all position masks, rejection of a draft followed by a different verified
+token, and recovery after a failed commit. The earlier parser position remains
+unchanged. Direct C ABI probes establish native clone semantics, separately from
+compiled C++ and phone acceptance. GuideAI's JSON decoding stays regular until
+actual speculative execution and physical cost have been validated.
