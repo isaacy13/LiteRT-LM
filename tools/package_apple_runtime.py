@@ -6,12 +6,14 @@ artifact. No nested framework or standalone dylib is placed in an iOS app.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
 import plistlib
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 import zipfile
@@ -35,7 +37,13 @@ SAMPLER_FUNCTIONS = {
 
 
 def run(*args):
-    return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as error:
+        # check_output captures the diagnostic; its default traceback omits it.
+        raise RuntimeError(
+            f"Command failed ({error.returncode}): {shlex.join(args)}\n{error.output}"
+        ) from error
 
 
 def digest(path):
@@ -144,6 +152,27 @@ def inspect(frameworks):
     return results
 
 
+@contextmanager
+def retained_package_work(source_archive, destination, source):
+    failure_directory = destination.with_name(destination.name + "-failure")
+    if failure_directory.exists():
+        raise RuntimeError("Never replace retained package failure evidence")
+    with tempfile.TemporaryDirectory(prefix="litert-apple-package-") as temporary:
+        work = Path(temporary)
+        try:
+            yield work
+        except Exception as error:
+            # Preserve the binaries at the actual failing operation. The original
+            # Bazel archive is uploaded separately, before any Mach-O edits.
+            shutil.copytree(work, failure_directory)
+            (failure_directory / "FAILURE.json").write_text(json.dumps({
+                "source": source, "sourceArchiveSHA256": digest(source_archive),
+                "artifactAcceptance": False, "modelQueries": 0,
+                "errorType": type(error).__name__, "error": str(error),
+            }, indent=2) + "\n")
+            raise
+
+
 def package(source_archive, destination):
     if destination.exists():
         raise RuntimeError("Never replace a retained package")
@@ -151,8 +180,7 @@ def package(source_archive, destination):
     source = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
     if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Package only committed source")
-    with tempfile.TemporaryDirectory(prefix="litert-apple-package-") as temporary:
-        work = Path(temporary)
+    with retained_package_work(source_archive, destination, source) as work:
         with zipfile.ZipFile(source_archive) as bundle:
             if any(Path(member.filename).is_absolute() or ".." in Path(member.filename).parts
                    for member in bundle.infolist()):
