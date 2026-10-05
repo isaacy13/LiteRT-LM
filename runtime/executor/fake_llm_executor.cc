@@ -296,6 +296,9 @@ absl::Status FakeLlmExecutor::Reset() {
   prefill_times_ = 0;
   decode_times_ = 0;
   current_step_ = 0;
+  // Reset discards this fake's decode state. Do not advertise an old prefix
+  // that could suppress the next prefill while last_op_ is kNone.
+  processed_tokens_ = ProcessedTokens();
   prefill_tokens_total_ = 0;
   last_op_ = LastOp::kNone;
   return absl::OkStatus();

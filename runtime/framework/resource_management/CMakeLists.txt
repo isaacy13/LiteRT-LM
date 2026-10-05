@@ -37,6 +37,27 @@ target_link_libraries(runtime_framework_resource_manager_manager
 )
 
 # ==============================================================================
+# Execution Manager
+# ==============================================================================
+add_litertlm_library(runtime_framework_resource_manager_execution_manager STATIC
+  execution_manager.cc
+)
+add_library(LiteRTLM::Runtime::Framework::ResourceManager::ExecutionManager ALIAS runtime_framework_resource_manager_execution_manager)
+
+target_include_directories(runtime_framework_resource_manager_execution_manager
+  PUBLIC
+    ${LITERTLM_GENERATED_SRC_DIR}
+    ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_framework_resource_manager_execution_manager
+  PUBLIC
+    LiteRTLM::Runtime::Framework::ThreadOptions
+    LiteRTLM::Runtime::Util::ConvertTensorBuffer
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # Serial Execution Manager
 # ==============================================================================
 add_litertlm_library(runtime_framework_resource_manager_serial_execution_manager STATIC
@@ -53,6 +74,7 @@ target_include_directories(runtime_framework_resource_manager_serial_execution_m
 target_link_libraries(runtime_framework_resource_manager_serial_execution_manager
   PUBLIC
     LiteRTLM::Runtime::Framework::ThreadOptions
+    LiteRTLM::Runtime::Framework::ResourceManager::ExecutionManager
     LITERTLM_DEPS
 )
 
@@ -73,6 +95,7 @@ target_include_directories(runtime_framework_resource_manager_threaded_execution
 target_link_libraries(runtime_framework_resource_manager_threaded_execution_manager
   PUBLIC
     LiteRTLM::Runtime::Framework::ThreadOptions
+    LiteRTLM::Runtime::Framework::ResourceManager::ExecutionManager
     LITERTLM_DEPS
 )
 
@@ -87,6 +110,7 @@ target_link_libraries(runtime_framework_resource_libs INTERFACE
   LiteRTLM::Runtime::Framework::ResourceManager::ContextHandler
   LiteRTLM::Runtime::Framework::ResourceManager::ProcessedContext
   LiteRTLM::Runtime::Framework::ResourceManager::Manager
+  LiteRTLM::Runtime::Framework::ResourceManager::ExecutionManager
   LiteRTLM::Runtime::Framework::ResourceManager::SerialExecutionManager
   LiteRTLM::Runtime::Framework::ResourceManager::ThreadedExecutionManager
 )

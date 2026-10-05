@@ -104,9 +104,10 @@ allocator permits deterministic allocation-failure coverage without global state
 or real memory exhaustion. The new native regression runs for both managers,
 requires exactly one error, bounded task/session/pool completion, explicit release,
 and a fresh successful session on the same manager with the real allocator.
-The full existing execution-manager suite is added to the host gate. Compilation
-and execution remain pending; this source change does not establish phone OOM,
-cancellation, memory, performance or SDK/package acceptance.
+The full existing execution-manager suite is added to the host gate. The 292dec9
+gate compiled and executed nine targets and 163 cases without skips; two fresh
+session recovery variants failed. This does not establish phone OOM, cancellation,
+memory, performance or SDK/package acceptance.
 
 The full execution-manager target previously skipped three serial variants. Its
 serial waits drive queued work and cannot interrupt an already running decode;
@@ -117,3 +118,21 @@ control runs its original pending-work/completed-callback check for both manager
 No skipped cases are accepted. The first owned 6c8706d gate was canceled after this
 coverage issue was identified; its partial logs/results are retained, not treated
 as a native test or SDK acceptance result.
+
+That gate's injected error, callback and bounded completion checks succeeded;
+the next session failed with `Decode called without prior prefill or decode`.
+`FakeLlmExecutor::Reset` cleared its counters and decode state while retaining
+its processed-token ledger. The resource manager could then skip a cached prefix
+the fake could no longer decode. Reset now clears that stale ledger. A direct
+native regression checks repeated reset, empty processed tokens, decode refusal
+before prefill, and identical fresh prefill/decode output. The manager recovery
+test and its original assertions are unchanged. The complete fake-executor target
+joins the gate: ten targets, 175 cases, no failures, errors or skips required.
+This corrects test-executor state; it is not evidence of a phone backend failure
+or proof of fresh-session recovery until the corrected native gate executes.
+
+CMake now compiles the shared `execution_manager.cc` implementation in one static
+target linked by both derived manager targets and the resource-manager facade.
+Its prior explicit target list omitted the new implementation; the generated
+source glob only copied it. Apple Bazel compilation does not validate a complete
+CMake build, which remains a separate verification requirement.

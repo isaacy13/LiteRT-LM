@@ -50,6 +50,7 @@ jobs:
             //runtime/components/constrained_decoding:llg_constraint_test \
             //runtime/components/constrained_decoding:llg_fc_tool_calls_test \
             //runtime/components/constrained_decoding:llg_python_tool_calls_test \
+            //runtime/executor:fake_llm_executor_test \
             //runtime/framework/resource_management:execution_manager_test \
             2>&1 | tee native-tests.log
       - name: Preserve host test results before changing platforms
