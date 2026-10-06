@@ -740,6 +740,11 @@ TEST_F(InternalCallbackTest, InvalidFunctionCall) {
   callback(Responses(TaskState::kProcessing, {"not a function call"}));
   callback(Responses(TaskState::kProcessing, {"\n```"}));
 
+  EXPECT_FALSE(done_);
+  EXPECT_OK(status_);
+  EXPECT_THAT(output_, IsEmpty());
+  callback(Responses(TaskState::kDone));
+
   EXPECT_TRUE(done_);
   EXPECT_THAT(status_, StatusIs(absl::StatusCode::kInvalidArgument));
 }

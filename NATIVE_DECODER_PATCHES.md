@@ -218,9 +218,14 @@ nor session/executor ownership and adds no public native or Swift API.
 The existing callback suite now includes exact first-error identity, later malformed
 input and text, six terminal task states, three native failure statuses, cancellation
 cleanup and repeated terminal delivery. A callback-only workflow dispatch runs this
-host target without building or packaging an SDK. The complete updated suite is
-pending execution; worker joins, C/Swift ownership under ASan and physical-device
-acceptance are not established by these callback fixtures.
+host target without building or packaging an SDK. The first complete gate at
+`2519c73` ran all 43 cases: all eleven new cases and 31 existing cases passed.
+The remaining existing malformed-call fixture expected the former immediate
+processing error without a terminal input. It now requires no processing error,
+then supplies task completion and retains its original invalid-argument rejection.
+The original 42-pass/one-failure log and XML are retained in workflow `37542163249`.
+The corrected complete suite is pending execution; worker joins, C/Swift ownership
+under ASan and physical-device acceptance are not established by these fixtures.
 
 ## Allocation errors finish their native task
 
