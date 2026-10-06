@@ -142,6 +142,54 @@ TEST_F(InternalCallbackTest, Text) {
                                    TextMessage("some "), TextMessage("text")));
 }
 
+TEST_F(InternalCallbackTest,
+       ProcessingParseErrorWaitsForTerminalAndPreservesFirstError) {
+  const std::string malformed_tool = "```tool_code\ninvalid_code_one\n```";
+  auto expected_error = model_data_processor_->ToMessage(
+      Responses(TaskState::kProcessing, {malformed_tool}), processor_args_);
+  ASSERT_FALSE(expected_error.ok());
+
+  std::vector<absl::StatusOr<Message>> packets;
+  int completed_messages = 0;
+  int cancellations = 0;
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      [&](absl::StatusOr<Message> message) {
+        packets.push_back(std::move(message));
+      },
+      [&]() { ++cancellations; },
+      [&](Message message) { ++completed_messages; });
+
+  callback(Responses(TaskState::kProcessing, {"before"}));
+  ASSERT_EQ(packets.size(), 1);
+  ASSERT_OK(packets.front());
+  EXPECT_EQ(*packets.front(), TextMessage("before"));
+
+  callback(Responses(TaskState::kProcessing, {malformed_tool}));
+  EXPECT_EQ(packets.size(), 1);
+  callback(Responses(TaskState::kProcessing,
+                     {"```tool_code\ninvalid_code_two\n```"}));
+  callback(Responses(TaskState::kProcessing, {"after"}));
+  EXPECT_EQ(packets.size(), 1);
+
+  callback(Responses(TaskState::kDone));
+  EXPECT_EQ(packets.size(), 2);
+  EXPECT_EQ(packets.back().status(), expected_error.status());
+  EXPECT_EQ(completed_messages, 0);
+  EXPECT_EQ(cancellations, 0);
+
+  int terminal_packets = 0;
+  for (const auto& packet : packets) {
+    if (!packet.ok() || packet->empty()) ++terminal_packets;
+  }
+  EXPECT_EQ(terminal_packets, 1);
+
+  const size_t delivered_packets = packets.size();
+  callback(Responses(TaskState::kProcessing, {"after terminal"}));
+  callback(Responses(TaskState::kDone));
+  EXPECT_EQ(packets.size(), delivered_packets);
+}
+
 TEST_F(InternalCallbackTest, ToolCall) {
   auto user_callback = CreateUserMessageCallback(output_, done_, status_);
   auto callback =

@@ -1,0 +1,68 @@
+name: Native callback contract
+
+on:
+  workflow_call:
+    inputs:
+      test_filter:
+        description: GTest filter for the existing callback suite
+        default: '*'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  callback:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+      CALLBACK_FILTER: ${{ inputs.test_filter }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          lfs: false
+      - name: Fetch only host native libraries
+        run: |
+          git lfs install --local
+          git lfs pull --include='prebuilt/macos_arm64/*.dylib'
+      - name: Install pinned Bazelisk
+        run: |
+          test "$(uname -m)" = arm64
+          curl -fL --retry 3 -o "$RUNNER_TEMP/bazelisk" https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-darwin-arm64
+          echo 'cee851f726789227d5561004e9904a52be45c3efb56f8b38b6993d6adbaa0409  '"$RUNNER_TEMP/bazelisk" | shasum -a 256 -c -
+          chmod +x "$RUNNER_TEMP/bazelisk"
+      - name: Identify native compiler cache
+        id: native-toolchain
+        run: |
+          echo "BAZEL_DISK_CACHE=$RUNNER_TEMP/guideai-native-bazel-cache" >> "$GITHUB_ENV"
+          native_toolchain_fingerprint=$( { xcodebuild -version; xcrun clang --version; } | shasum -a 256 | cut -d ' ' -f 1)
+          echo "fingerprint=$native_toolchain_fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Restore existing native compilation cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.BAZEL_DISK_CACHE }}
+          key: callback-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ github.sha }}
+          restore-keys: |
+            native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-
+      - name: Run existing native callback fixtures
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s --local_ram_resources=4096 \
+            --define=litert_runtime_link_mode=dynamic --nocache_test_results \
+            --test_output=all --test_timeout=60 --verbose_failures \
+            --test_arg="--gtest_filter=$CALLBACK_FILTER" \
+            //runtime/conversation:internal_callback_util_test \
+            2>&1 | tee native-callback-tests.log
+      - name: Retain exact callback evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-callback-${{ github.sha }}
+          path: |
+            native-callback-tests.log
+            bazel-testlogs/runtime/conversation/internal_callback_util_test/test.log
+            bazel-testlogs/runtime/conversation/internal_callback_util_test/test.xml
+          if-no-files-found: error

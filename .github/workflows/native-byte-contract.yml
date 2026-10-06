@@ -4,6 +4,15 @@ on:
   push:
     branches: [codex/native-tokenizer-byte-contract]
   workflow_dispatch:
+    inputs:
+      callback_only:
+        description: Run only the bounded host callback suite
+        default: false
+        type: boolean
+      callback_test_filter:
+        description: GTest filter for the callback-only host suite
+        default: '*'
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +23,7 @@ concurrency:
 
 jobs:
   native:
+    if: ${{ !inputs.callback_only }}
     runs-on: macos-15
     timeout-minutes: 180
     env:
@@ -134,3 +144,9 @@ jobs:
         with:
           path: ${{ env.BAZEL_DISK_CACHE }}
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
+
+  callback:
+    if: ${{ inputs.callback_only }}
+    uses: ./.github/workflows/native-callback-contract.yml
+    with:
+      test_filter: ${{ inputs.callback_test_filter }}
