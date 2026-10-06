@@ -46,6 +46,32 @@ class GemmaToolConstraintAbiTest
     ASSERT_OK_AND_ASSIGN(
         auto tokenizer,
         ::litert::support::SentencePieceTokenizer::CreateFromFile(path.string()));
+    const bool fc = GetParam() == kLiteRtLmGemmaFuncallFormatFcStyle;
+    // FC markers are absent from the public Gemma 3 fixture. This ABI fixture
+    // extends its vocabulary; it does not represent Gemma 4 model inference.
+    if (fc) {
+      const int original_vocab = tokenizer->GetVocabSize();
+      auto vocabulary = std::make_unique<sentencepiece::ModelProto>(
+          tokenizer->GetProcessor().model_proto());
+      for (const char* marker : {"<|tool_call>", "<tool_call|>", "<|\"|>",
+                                 "<|tool_response>"}) {
+        ASSERT_FALSE(std::any_of(vocabulary->pieces().begin(),
+                                 vocabulary->pieces().end(),
+                                 [marker](const auto& piece) {
+                                   return piece.piece() == marker;
+                                 }));
+        auto* piece = vocabulary->add_pieces();
+        piece->set_piece(marker);
+        piece->set_type(sentencepiece::ModelProto::SentencePiece::USER_DEFINED);
+        piece->set_score(0.0f);
+      }
+      vocabulary->mutable_trainer_spec()->set_vocab_size(
+          vocabulary->pieces_size());
+      ASSERT_OK_AND_ASSIGN(
+          tokenizer, ::litert::support::SentencePieceTokenizer::CreateFromProto(
+                         std::move(vocabulary)));
+      ASSERT_EQ(tokenizer->GetVocabSize(), original_vocab + 4);
+    }
     const auto model = tokenizer->GetProcessor().model_proto().SerializeAsString();
     const int eos[] = {1};
     const int* stops[] = {eos};
@@ -57,7 +83,6 @@ class GemmaToolConstraintAbiTest
                  &LiteRtLmGemmaModelConstraintProvider_Destroy);
     ASSERT_NE(provider, nullptr);
 
-    const bool fc = GetParam() == kLiteRtLmGemmaFuncallFormatFcStyle;
     const LiteRtLmGemmaModelConstraintOptions options = {
         .funcall_format = GetParam(),
         .constraint_mode = kLiteRtLmGemmaConstraintModeFunctionCallOnly,

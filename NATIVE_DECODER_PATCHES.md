@@ -5,6 +5,23 @@ native source here and consumes a verified binary through its small Swift packag
 
 ## Constraint ownership and token bytes
 
+The `0bc42c2` SDK gate compiled and executed four native Gemma tool-mask cases.
+Both Python-format cases passed through composite mask application and state
+advancement. Both FC-format cases failed during constraint creation because the
+public Gemma 3 SentencePiece fixture lacks `<|tool_call>`. No FC mask ran, and the
+remaining host, conversation, framework and package gates were not executed.
+The complete terminal log, test XML and artifact are retained. Compilation cache
+save succeeded; this cold ABI build used 4,501 actions and approximately 20 minutes.
+
+The FC ABI fixture now appends its four required USER_DEFINED marker pieces to a
+copy of that fixture's model proto. It preserves all existing pieces and IDs and
+recreates the actual SentencePiece tokenizer from the extended proto. Provider
+and tokenizer receive the same complete vocabulary. The Python fixture stays
+unchanged. All four original mask, vocabulary and state-advancement assertions
+remain required. This exercises the provider ABI with valid FC marker IDs; it
+does not claim Gemma 4 sampling or physical-device acceptance. The three upstream
+Gemma library pins and production decoder code are unchanged.
+
 The constraint vocabulary preserves decoded bytes and tokenizer control metadata.
 SentencePiece grammar-input encoding uses ordinary token IDs only when their
 constraint bytes exactly match the input; otherwise it uses byte fallback tokens.
