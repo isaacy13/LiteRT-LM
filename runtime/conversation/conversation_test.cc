@@ -190,40 +190,19 @@ class MockEngine : public Engine {
               (override));
 };
 
-// Count actual native vocabulary construction without replacing SentencePiece's
-// byte/control metadata or its grammar-input encoding.
-class CountingTokenizer : public Tokenizer {
+// Gemma's native tool processor consumes the concrete SentencePiece processor.
+// Keep that actual object while counting LLGuidance vocabulary construction.
+class CountingTokenizer : public SentencePieceTokenizer {
  public:
-  explicit CountingTokenizer(Tokenizer& tokenizer) : tokenizer_(tokenizer) {}
-  support::TokenizerType GetTokenizerType() const override {
-    return tokenizer_.GetTokenizerType();
-  }
-  absl::StatusOr<support::TokenIds> TextToTokenIds(absl::string_view text) override {
-    return tokenizer_.TextToTokenIds(text);
-  }
-  absl::StatusOr<int> TokenToId(absl::string_view token) override {
-    return tokenizer_.TokenToId(token);
-  }
-  absl::StatusOr<std::string> TokenIdsToText(absl::Span<const int> ids,
-                                         bool skip_special) override {
-    return tokenizer_.TokenIdsToText(ids, skip_special);
-  }
-  std::vector<std::string> GetTokens() const override {
-    return tokenizer_.GetTokens();
-  }
+  explicit CountingTokenizer(SentencePieceTokenizer&& tokenizer)
+      : SentencePieceTokenizer(std::move(tokenizer)) {}
   support::ConstraintVocabulary GetConstraintVocabulary() const override {
     ++vocabulary_reads_;
-    return tokenizer_.GetConstraintVocabulary();
+    return SentencePieceTokenizer::GetConstraintVocabulary();
   }
-  absl::StatusOr<support::TokenIds> BytesToTokenIdsForConstraint(
-      absl::string_view bytes, absl::Span<const int> excluded) override {
-    return tokenizer_.BytesToTokenIdsForConstraint(bytes, excluded);
-  }
-  int GetVocabSize() const override { return tokenizer_.GetVocabSize(); }
   int vocabulary_reads() const { return vocabulary_reads_; }
 
  private:
-  Tokenizer& tokenizer_;
   mutable int vocabulary_reads_ = 0;
 };
 
@@ -480,7 +459,8 @@ class ConversationTest : public testing::TestWithParam<ConversationTestParams> {
 };
 
 TEST_P(ConversationTest, EngineConstraintProviderReusedByCreate) {
-  CountingTokenizer tokenizer(*tokenizer_);
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
   auto engine = CreateMockEngine(CreateMockSession());
   EXPECT_CALL(*engine, GetTokenizer()).WillRepeatedly(testing::ReturnRef(tokenizer));
   ASSERT_OK_AND_ASSIGN(
@@ -501,7 +481,8 @@ TEST_P(ConversationTest, EngineConstraintProviderReusedByCreate) {
 }
 
 TEST_P(ConversationTest, EngineConstraintProviderReusedByClone) {
-  CountingTokenizer tokenizer(*tokenizer_);
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
   auto session = CreateMockSession();
   auto* session_ptr = session.get();
   auto engine = CreateMockEngine(std::move(session));

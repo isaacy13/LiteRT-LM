@@ -46,6 +46,19 @@ production code is unchanged. The failed evidence is retained; conversation
 integration and framework/package gates did not run. The next complete gate is
 required before acceptance.
 
+The `51fc265` gate passed all 185 host cases with zero skips. Conversation
+integration passed four unconstrained cases; two constrained shard processes
+crashed with exit 139 on their first Create case, leaving two Clone cases
+unexecuted. The test decorator reported SentencePiece's type without being a
+SentencePiece object, while Gemma's processor casts that type to the concrete
+class to read its model proto. The counting test now derives from SentencePiece
+and moves the real fixture tokenizer into that base; native processor access,
+byte/control metadata and grammar-input encoding use the actual implementation.
+All original Create/Clone and vocabulary-count assertions remain. Production
+cache code is unchanged. Failed logs/XML and synthetic shard-error accounting
+are retained; framework/package gates did not run. A complete corrected gate
+is required before acceptance.
+
 ## Apple runtime linkage
 
 The pinned LiteRT dependency routes its iOS dynamic runtime to a `macos_dylib`
