@@ -18,7 +18,6 @@ jobs:
     timeout-minutes: 180
     env:
       GIT_LFS_SKIP_SMUDGE: '1'
-      BAZEL_DISK_CACHE: ${{ runner.temp }}/guideai-native-bazel-cache
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -36,6 +35,7 @@ jobs:
       - name: Identify native compiler cache
         id: native-toolchain
         run: |
+          echo "BAZEL_DISK_CACHE=$RUNNER_TEMP/guideai-native-bazel-cache" >> "$GITHUB_ENV"
           native_toolchain_fingerprint=$( { xcodebuild -version; xcrun clang --version; } | shasum -a 256 | cut -d ' ' -f 1)
           echo "fingerprint=$native_toolchain_fingerprint" >> "$GITHUB_OUTPUT"
       - name: Restore native compilation cache

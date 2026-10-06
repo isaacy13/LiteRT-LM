@@ -65,6 +65,10 @@ Bazel's content keys invalidate changed actions; a 3 GiB garbage-collection
 policy limits the idle cache. Host, ABI and conversation tests explicitly disable
 test-result caching, so reused compilation does not substitute for execution.
 Cache restore/save failures do not bypass or fail the native acceptance gates.
+The first cache workflow at `b553f61` failed validation with zero jobs and no
+compiled/executed cases. Initialize its cache path from `RUNNER_TEMP` in the
+toolchain step; runner context is unavailable in job-level environment values.
+The failed run/check-suite metadata is retained.
 
 ## Apple runtime linkage
 
