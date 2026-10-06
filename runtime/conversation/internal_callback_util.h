@@ -40,6 +40,9 @@ namespace litert::lm {
 //     cancellation exception is caught.
 // - complete_message_callback: Will also be called in addition to
 //     user_callback when the task is completed.
+// Processing parse errors are retained until task termination. The first error
+// is preserved, later processing packets are suppressed, and a terminal message
+// or error is delivered at most once. Cancellation retains its history cleanup.
 absl::AnyInvocable<void(absl::StatusOr<Responses>)> CreateInternalCallback(
     const ModelDataProcessor& model_data_processor,
     DataProcessorArguments processor_args, const std::vector<Channel>& channels,

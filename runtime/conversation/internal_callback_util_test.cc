@@ -190,6 +190,105 @@ TEST_F(InternalCallbackTest,
   EXPECT_EQ(packets.size(), delivered_packets);
 }
 
+class ProcessingParseErrorTerminalTest
+    : public InternalCallbackTest,
+      public testing::WithParamInterface<TaskState> {};
+
+TEST_P(ProcessingParseErrorTerminalTest, PreservesErrorAndCancellationPolicy) {
+  const std::string malformed_tool = "```tool_code\ninvalid_code\n```";
+  auto expected_error = model_data_processor_->ToMessage(
+      Responses(TaskState::kProcessing, {malformed_tool}), processor_args_);
+  ASSERT_FALSE(expected_error.ok());
+
+  std::vector<absl::StatusOr<Message>> packets;
+  int cancellations = 0;
+  int completed_messages = 0;
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      [&](absl::StatusOr<Message> message) {
+        packets.push_back(std::move(message));
+      },
+      [&]() { ++cancellations; },
+      [&](Message message) { ++completed_messages; },
+      /*open_channel_name=*/std::nullopt,
+      /*return_error_on_max_tokens_reached=*/true);
+
+  callback(Responses(TaskState::kProcessing, {malformed_tool}));
+  EXPECT_TRUE(packets.empty());
+  callback(Responses(GetParam()));
+  ASSERT_EQ(packets.size(), 1);
+  EXPECT_EQ(packets.front().status(), expected_error.status());
+  EXPECT_EQ(completed_messages, 0);
+  const bool cancels_history = GetParam() == TaskState::kCancelled ||
+                               GetParam() == TaskState::kDependentTaskCancelled ||
+                               GetParam() == TaskState::kMaxNumTokensReached;
+  EXPECT_EQ(cancellations, cancels_history ? 1 : 0);
+
+  callback(Responses(TaskState::kDone));
+  EXPECT_EQ(packets.size(), 1);
+  EXPECT_EQ(cancellations, cancels_history ? 1 : 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TerminalStates, ProcessingParseErrorTerminalTest,
+    testing::Values(TaskState::kDone, TaskState::kMaxNumTokensReached,
+                    TaskState::kFailed, TaskState::kDependentTaskFailed,
+                    TaskState::kCancelled, TaskState::kDependentTaskCancelled));
+
+class ProcessingParseErrorStatusTest
+    : public InternalCallbackTest,
+      public testing::WithParamInterface<absl::StatusCode> {};
+
+TEST_P(ProcessingParseErrorStatusTest, PreservesFirstErrorThroughNativeFailure) {
+  const std::string malformed_tool = "```tool_code\ninvalid_code\n```";
+  auto expected_error = model_data_processor_->ToMessage(
+      Responses(TaskState::kProcessing, {malformed_tool}), processor_args_);
+  ASSERT_FALSE(expected_error.ok());
+
+  std::vector<absl::StatusOr<Message>> packets;
+  int cancellations = 0;
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      [&](absl::StatusOr<Message> message) {
+        packets.push_back(std::move(message));
+      },
+      [&]() { ++cancellations; });
+
+  callback(Responses(TaskState::kProcessing, {malformed_tool}));
+  EXPECT_TRUE(packets.empty());
+  callback(absl::Status(GetParam(), "later native error"));
+  ASSERT_EQ(packets.size(), 1);
+  EXPECT_EQ(packets.front().status(), expected_error.status());
+  EXPECT_EQ(cancellations, GetParam() == absl::StatusCode::kCancelled ? 1 : 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    NativeFailures, ProcessingParseErrorStatusTest,
+    testing::Values(absl::StatusCode::kCancelled, absl::StatusCode::kInternal,
+                    absl::StatusCode::kResourceExhausted));
+
+TEST_F(InternalCallbackTest, SuccessfulTerminalDeliveredOnce) {
+  int terminal_packets = 0;
+  int completed_messages = 0;
+  auto callback = CreateInternalCallback(
+      *model_data_processor_, processor_args_, channels_,
+      [&](absl::StatusOr<Message> message) {
+        ASSERT_OK(message);
+        if (message->empty()) ++terminal_packets;
+        else output_.push_back(*message);
+      },
+      /*cancel_callback=*/nullptr,
+      [&](Message message) { ++completed_messages; });
+
+  callback(Responses(TaskState::kProcessing, {"hello"}));
+  callback(Responses(TaskState::kDone));
+  callback(Responses(TaskState::kProcessing, {"late"}));
+  callback(Responses(TaskState::kDone));
+  EXPECT_THAT(output_, ElementsAre(TextMessage("hello")));
+  EXPECT_EQ(terminal_packets, 1);
+  EXPECT_EQ(completed_messages, 1);
+}
+
 TEST_F(InternalCallbackTest, ToolCall) {
   auto user_callback = CreateUserMessageCallback(output_, done_, status_);
   auto callback =

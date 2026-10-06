@@ -199,6 +199,29 @@ incorrect byte-equality assumption are retained separately. A producer control
 checks that linkage rewriting never strips signatures and still rewrites every
 required dependency. The next complete SDK gate remains required before adoption.
 
+## Processing parse errors retain the callback until task termination
+
+The callback-only host gate at `83357c4` reproduced a malformed complete tool
+fence during processing followed by more text and task completion. The original
+callback sent an immediate error, later text, and three terminal-equivalent
+packets. Its final reparse also replaced the original error's full-response
+context. The one selected regression executed and failed; its original log and
+XML are retained in workflow `37541464094`. No SDK build or package job ran.
+
+The callback now retains the first processing error until the native task reaches
+a terminal state. Further processing packets are suppressed; successful chunks
+before the error remain unchanged. Terminal delivery is guarded once, failed
+streams cannot publish completed-message history, and cancellation and token-limit
+history cleanup retain their existing policy. This changes neither task shutdown
+nor session/executor ownership and adds no public native or Swift API.
+
+The existing callback suite now includes exact first-error identity, later malformed
+input and text, six terminal task states, three native failure statuses, cancellation
+cleanup and repeated terminal delivery. A callback-only workflow dispatch runs this
+host target without building or packaging an SDK. The complete updated suite is
+pending execution; worker joins, C/Swift ownership under ASan and physical-device
+acceptance are not established by these callback fixtures.
+
 ## Allocation errors finish their native task
 
 The external-sampler decoded-ID allocation error previously called the threaded
