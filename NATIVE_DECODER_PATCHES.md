@@ -36,6 +36,16 @@ Both Bazel and CMake describe the cache dependency. Native build/package gates,
 actual model semantics and physical initialization/RAM/energy measurements remain
 required; source changes alone establish no device performance improvement.
 
+The first cache gate at `9e20d7e` compiled and ran eleven host targets and 185
+cases with zero skips. Four cache controls failed LLGuidance's `ff_tokens`
+assertion because they committed a token before computing the initial mask.
+The controls now use the same mask-before-commit sequence as native sampling and
+assert that the chosen token is allowed before advancing. Original EOS, provider
+identity, eviction, retained-state and concurrency assertions remain. Cache
+production code is unchanged. The failed evidence is retained; conversation
+integration and framework/package gates did not run. The next complete gate is
+required before acceptance.
+
 ## Apple runtime linkage
 
 The pinned LiteRT dependency routes its iOS dynamic runtime to a `macos_dylib`

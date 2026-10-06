@@ -135,6 +135,8 @@ TEST_F(ConstraintProviderCacheTest, DifferentStopConfigurationsKeepTheirOwnEos) 
     const auto& provider = eos == 1 ? first : second;
     ASSERT_OK_AND_ASSIGN(auto grammar, Grammar(*provider));
     auto state = grammar->Start();
+    ASSERT_OK_AND_ASSIGN(auto initial_mask, grammar->ComputeMask(*state));
+    ASSERT_TRUE(Allowed(*initial_mask, 3));
     ASSERT_OK_AND_ASSIGN(state, grammar->ComputeNext(*state, 3));
     ASSERT_OK_AND_ASSIGN(auto mask, grammar->ComputeMask(*state));
     EXPECT_TRUE(Allowed(*mask, eos));
@@ -169,6 +171,8 @@ TEST_F(ConstraintProviderCacheTest, StopOrderPreservesDefaultEosSelection) {
   for (int eos : {1, 2}) {
     ASSERT_OK_AND_ASSIGN(auto grammar, Grammar(*(eos == 1 ? first : second)));
     auto state = grammar->Start();
+    ASSERT_OK_AND_ASSIGN(auto initial_mask, grammar->ComputeMask(*state));
+    ASSERT_TRUE(Allowed(*initial_mask, 3));
     ASSERT_OK_AND_ASSIGN(state, grammar->ComputeNext(*state, 3));
     ASSERT_OK_AND_ASSIGN(auto mask, grammar->ComputeMask(*state));
     EXPECT_TRUE(Allowed(*mask, eos));
@@ -229,6 +233,8 @@ TEST_F(ConstraintProviderCacheTest, EvictedProviderAndItsParserRemainUsable) {
   std::weak_ptr<const ConstraintProvider> old = provider;
   ASSERT_OK_AND_ASSIGN(auto grammar, Grammar(*provider, "ab|ba"));
   auto initial = grammar->Start();
+  ASSERT_OK_AND_ASSIGN(auto initial_mask, grammar->ComputeMask(*initial));
+  ASSERT_TRUE(Allowed(*initial_mask, 3));
   ASSERT_OK_AND_ASSIGN(auto next, grammar->ComputeNext(*initial, 3));
   ASSERT_OK_AND_ASSIGN(auto replacement,
                       engine_.GetConstraintProvider(LlGuidanceConfig(), {{2}}));
@@ -275,6 +281,8 @@ TEST_F(ConstraintProviderCacheTest, ConcurrentRequestsShareOnlyTheVocabulary) {
       ASSERT_OK_AND_ASSIGN(auto grammar, Grammar(*providers[i], "ab|ba"));
       auto initial = grammar->Start();
       const int first = i % 2 == 0 ? 3 : 4;
+      ASSERT_OK_AND_ASSIGN(auto initial_mask, grammar->ComputeMask(*initial));
+      ASSERT_TRUE(Allowed(*initial_mask, first));
       ASSERT_OK_AND_ASSIGN(auto next, grammar->ComputeNext(*initial, first));
       ASSERT_OK_AND_ASSIGN(auto mask, grammar->ComputeMask(*next));
       EXPECT_TRUE(Allowed(*mask, first == 3 ? 4 : 3));
