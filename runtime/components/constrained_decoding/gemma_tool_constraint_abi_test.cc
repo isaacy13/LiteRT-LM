@@ -42,7 +42,7 @@ class GemmaToolConstraintAbiTest
   void ExerciseDecoder() {
     const bool fc = GetParam() == kLiteRtLmGemmaFuncallFormatFcStyle;
     const auto path = std::filesystem::path(::testing::SrcDir()) /
-                      "litert_lm/runtime/components/testdata/"
+                      "litert_lm/runtime/components/testdata" /
                       (fc ? "function_gemma_sentencepiece.model"
                           : "gemma3_sentencepiece.model");
     ASSERT_OK_AND_ASSIGN(

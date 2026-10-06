@@ -28,6 +28,11 @@ assertions remain. Full native gates must execute before acceptance. These publi
 fixtures do not establish Gemma 4 sampling or physical-device acceptance. The
 three upstream Gemma library pins and production decoder code are unchanged.
 
+The first unmodified-fixture candidate, `098ae9a`, failed compilation because
+the filesystem path expression lacked a separator before the selected filename.
+Zero tests executed. Its terminal log and artifact are retained. The corrected
+expression leaves fixture bytes, markers, production code and assertions intact.
+
 The constraint vocabulary preserves decoded bytes and tokenizer control metadata.
 SentencePiece grammar-input encoding uses ordinary token IDs only when their
 constraint bytes exactly match the input; otherwise it uses byte fallback tokens.
