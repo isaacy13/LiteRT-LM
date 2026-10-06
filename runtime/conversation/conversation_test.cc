@@ -42,6 +42,7 @@
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/external_constraint_config.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
 #include "runtime/components/constrained_decoding/repetition_penalty_config.h"
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
@@ -187,6 +188,22 @@ class MockEngine : public Engine {
               (const SessionConfig& session_config), (override));
   MOCK_METHOD(absl::Status, WaitUntilDone, (absl::Duration timeout),
               (override));
+};
+
+// Gemma's native tool processor consumes the concrete SentencePiece processor.
+// Keep that actual object while counting LLGuidance vocabulary construction.
+class CountingTokenizer : public SentencePieceTokenizer {
+ public:
+  explicit CountingTokenizer(SentencePieceTokenizer&& tokenizer)
+      : SentencePieceTokenizer(std::move(tokenizer)) {}
+  support::ConstraintVocabulary GetConstraintVocabulary() const override {
+    ++vocabulary_reads_;
+    return SentencePieceTokenizer::GetConstraintVocabulary();
+  }
+  int vocabulary_reads() const { return vocabulary_reads_; }
+
+ private:
+  mutable int vocabulary_reads_ = 0;
 };
 
 class MockTaskController : public SessionInterface::TaskController {
@@ -440,6 +457,50 @@ class ConversationTest : public testing::TestWithParam<ConversationTestParams> {
   bool enable_constrained_decoding_ = GetParam().enable_constrained_decoding;
   bool prefill_preface_on_init_ = GetParam().prefill_preface_on_init;
 };
+
+TEST_P(ConversationTest, EngineConstraintProviderReusedByCreate) {
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
+  auto engine = CreateMockEngine(CreateMockSession());
+  EXPECT_CALL(*engine, GetTokenizer()).WillRepeatedly(testing::ReturnRef(tokenizer));
+  ASSERT_OK_AND_ASSIGN(
+      auto config, ConversationConfig::Builder()
+                       .SetSessionConfig(session_config_)
+                       .SetOverwritePromptTemplate(PromptTemplate(kTestJinjaPromptTemplate))
+                       .SetEnableConstrainedDecoding(enable_constrained_decoding_)
+                       .SetPrefillPrefaceOnInit(prefill_preface_on_init_)
+                       .SetConstraintProviderConfig(LlGuidanceConfig())
+                       .Build(*engine));
+  ASSERT_OK_AND_ASSIGN(auto first, Conversation::Create(*engine, config));
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+  EXPECT_CALL(*engine, CreateSession(testing::_))
+      .WillOnce(testing::Return(CreateMockSession()));
+  ASSERT_OK_AND_ASSIGN(auto second, Conversation::Create(*engine, config));
+  EXPECT_NE(first.get(), second.get());
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+}
+
+TEST_P(ConversationTest, EngineConstraintProviderReusedByClone) {
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
+  auto session = CreateMockSession();
+  auto* session_ptr = session.get();
+  auto engine = CreateMockEngine(std::move(session));
+  EXPECT_CALL(*engine, GetTokenizer()).WillRepeatedly(testing::ReturnRef(tokenizer));
+  ASSERT_OK_AND_ASSIGN(
+      auto config, ConversationConfig::Builder()
+                       .SetSessionConfig(session_config_)
+                       .SetOverwritePromptTemplate(PromptTemplate(kTestJinjaPromptTemplate))
+                       .SetEnableConstrainedDecoding(enable_constrained_decoding_)
+                       .SetPrefillPrefaceOnInit(prefill_preface_on_init_)
+                       .SetConstraintProviderConfig(LlGuidanceConfig())
+                       .Build(*engine));
+  ASSERT_OK_AND_ASSIGN(auto conversation, Conversation::Create(*engine, config));
+  EXPECT_CALL(*session_ptr, Clone()).WillOnce(testing::Return(CreateMockSession()));
+  ASSERT_OK_AND_ASSIGN(auto clone, conversation->Clone());
+  EXPECT_NE(conversation.get(), clone.get());
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+}
 
 TEST_P(ConversationTest, SendMessage) {
   ASSERT_OK_AND_ASSIGN(auto model_assets,

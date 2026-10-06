@@ -14,6 +14,7 @@
 
 #include "support/tokenizer/sentencepiece_tokenizer.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,12 +24,45 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/str_replace.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "sentencepiece_model.pb.h"  // from @sentencepiece
+#include "model_interface.h"  // from @sentencepiece
 #include "sentencepiece_processor.h"  // from @sentencepiece
 
 namespace litert::support {
+namespace {
+
+bool IsConstraintControl(const sentencepiece::SentencePieceProcessor& processor,
+                         int id) {
+  return processor.IsControl(id) || processor.IsUnknown(id) ||
+         processor.IsUnused(id);
+}
+
+std::string ConstraintTokenBytes(
+    const sentencepiece::SentencePieceProcessor& processor, int id) {
+  const std::string& piece = processor.IdToPiece(id);
+  if (processor.IsByte(id)) {
+    return std::string(1, static_cast<char>(sentencepiece::PieceToByte(piece)));
+  }
+  if (IsConstraintControl(processor, id)) return piece;
+  return absl::StrReplaceAll(piece, {{"\xe2\x96\x81", " "}});
+}
+
+}  // namespace
+
+SentencePieceTokenizer::SentencePieceTokenizer(
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> processor)
+    : processor_(std::move(processor)), vocab_size_(processor_->GetPieceSize()) {
+  byte_token_ids_.fill(-1);
+  for (int id = 0; id < vocab_size_; ++id) {
+    if (processor_->IsByte(id)) {
+      int byte = sentencepiece::PieceToByte(processor_->IdToPiece(id));
+      if (byte >= 0 && byte < byte_token_ids_.size()) byte_token_ids_[byte] = id;
+    }
+  }
+}
 
 absl::StatusOr<std::unique_ptr<SentencePieceTokenizer>>
 SentencePieceTokenizer::CreateFromFile(absl::string_view model_path) {
@@ -120,6 +154,54 @@ std::vector<std::string> SentencePieceTokenizer::GetTokens() const {
 
 int SentencePieceTokenizer::GetVocabSize() const {
   return processor_->GetPieceSize();
+}
+
+ConstraintVocabulary SentencePieceTokenizer::GetConstraintVocabulary() const {
+  ConstraintVocabulary vocabulary;
+  vocabulary.token_bytes.reserve(vocab_size_);
+  for (int id = 0; id < vocab_size_; ++id) {
+    vocabulary.token_bytes.push_back(ConstraintTokenBytes(*processor_, id));
+    if (IsConstraintControl(*processor_, id)) {
+      vocabulary.special_token_ids.push_back(id);
+    }
+  }
+  return vocabulary;
+}
+
+absl::StatusOr<TokenIds> SentencePieceTokenizer::BytesToTokenIdsForConstraint(
+    absl::string_view bytes, absl::Span<const int> excluded_token_ids) {
+  auto excluded = [&](int id) {
+    return std::find(excluded_token_ids.begin(), excluded_token_ids.end(), id) !=
+           excluded_token_ids.end();
+  };
+  auto encoded = TextToTokenIds(bytes);
+  if (encoded.ok()) {
+    std::string reconstructed;
+    reconstructed.reserve(bytes.size());
+    bool ordinary = true;
+    for (int id : *encoded) {
+      if (IsConstraintControl(*processor_, id) || excluded(id)) {
+        ordinary = false;
+        break;
+      }
+      reconstructed += ConstraintTokenBytes(*processor_, id);
+    }
+    if (ordinary && reconstructed == bytes) return encoded;
+  }
+  // Byte pieces preserve source characters the normal encoder would change,
+  // as well as partial UTF8 at grammar boundaries. Faithful ordinary encodings
+  // retain their original model IDs.
+  TokenIds exact;
+  exact.reserve(bytes.size());
+  for (unsigned char byte : bytes) {
+    int id = byte_token_ids_[byte];
+    if (id < 0 || excluded(id)) {
+      return absl::InvalidArgumentError(
+          "SentencePiece cannot encode constraint bytes faithfully.");
+    }
+    exact.push_back(id);
+  }
+  return exact;
 }
 
 }  // namespace litert::support

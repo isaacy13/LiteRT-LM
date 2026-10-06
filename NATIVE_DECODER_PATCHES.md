@@ -1,0 +1,280 @@
+# GuideAI native decoder fork
+
+This fork starts at LiteRT-LM v0.17.1 (`5e58e9a`). GuideAI keeps the
+native source here and consumes a verified binary through its small Swift package.
+
+## Constraint ownership and token bytes
+
+The `0bc42c2` SDK gate compiled and executed four native Gemma tool-mask cases.
+Both Python-format cases passed through composite mask application and state
+advancement. Both FC-format cases failed during constraint creation because the
+public Gemma 3 SentencePiece fixture lacks `<|tool_call>`. No FC mask ran, and the
+remaining host, conversation, framework and package gates were not executed.
+The complete terminal log, test XML and artifact are retained. Compilation cache
+save succeeded; this cold ABI build used 4,501 actions and approximately 20 minutes.
+
+The subsequent `b53c0c1` gate rejected the extended FC vocabulary during provider
+creation as unsupported. Both Python cases passed; no FC mask or later gate ran.
+The complete failure evidence is retained. A small independent C API probe then
+successfully created providers and constraints using both unmodified upstream
+fixtures: Gemma 3 for Python and FunctionGemma for FC. Creation alone does not
+establish mask or state compatibility.
+
+The FC ABI test now uses the existing `function_gemma_sentencepiece.model` and
+its native `<start_function_call>`, `<end_function_call>`, `<escape>` and
+`<start_function_response>` markers. No vocabulary is fabricated or extended.
+The Python fixture and all four original mask, vocabulary and state-advancement
+assertions remain. Full native gates must execute before acceptance. These public
+fixtures do not establish Gemma 4 sampling or physical-device acceptance. The
+three upstream Gemma library pins and production decoder code are unchanged.
+
+The first unmodified-fixture candidate, `098ae9a`, failed compilation because
+the filesystem path expression lacked a separator before the selected filename.
+Zero tests executed. Its terminal log and artifact are retained. The corrected
+expression leaves fixture bytes, markers, production code and assertions intact.
+
+The constraint vocabulary preserves decoded bytes and tokenizer control metadata.
+SentencePiece grammar-input encoding uses ordinary token IDs only when their
+constraint bytes exactly match the input; otherwise it uses byte fallback tokens.
+Configured single-token stops cannot encode ordinary grammar text. Callback
+metadata remains owned by constraints and cloned states. Each committed token
+advances an independent parser clone so speculative rejection preserves earlier
+grammar positions and a failed commit cannot poison its input state.
+
+## Engine ownership of the constraint vocabulary
+
+Conversation creation and cloning now obtain their LLGuidance provider from the
+engine. One mutex-protected entry retains the immutable vocabulary, keyed by
+tokenizer identity, explicit EOS, configured special IDs and the exact ordered
+stop sequences. A changed key replaces that entry; failed initialization preserves
+the prior valid provider. Existing conversations retain their provider, and each
+grammar and parser state is still created independently. External providers retain
+their existing per-conversation ownership and do not evict the vocabulary.
+
+The engine clears its cache before tearing down its tokenizer. Native constraints
+still require their engine's tokenizer to remain alive. There is no global cache,
+unbounded configuration map, cached conversation or shared parser state.
+
+Ten controls exercise the actual engine API: repeated vocabulary construction,
+stop/EOS/special-ID and tokenizer changes, separate engines, failure preservation,
+external providers, retained parsers after eviction/clear and concurrent creation.
+Two conversation controls (four existing configurations each) count real
+SentencePiece vocabulary construction through actual Create and Clone paths.
+Both Bazel and CMake describe the cache dependency. Native build/package gates,
+actual model semantics and physical initialization/RAM/energy measurements remain
+required; source changes alone establish no device performance improvement.
+
+The first cache gate at `9e20d7e` compiled and ran eleven host targets and 185
+cases with zero skips. Four cache controls failed LLGuidance's `ff_tokens`
+assertion because they committed a token before computing the initial mask.
+The controls now use the same mask-before-commit sequence as native sampling and
+assert that the chosen token is allowed before advancing. Original EOS, provider
+identity, eviction, retained-state and concurrency assertions remain. Cache
+production code is unchanged. The failed evidence is retained; conversation
+integration and framework/package gates did not run. The next complete gate is
+required before acceptance.
+
+The `51fc265` gate passed all 185 host cases with zero skips. Conversation
+integration passed four unconstrained cases; two constrained shard processes
+crashed with exit 139 on their first Create case, leaving two Clone cases
+unexecuted. The test decorator reported SentencePiece's type without being a
+SentencePiece object, while Gemma's processor casts that type to the concrete
+class to read its model proto. The counting test now derives from SentencePiece
+and moves the real fixture tokenizer into that base; native processor access,
+byte/control metadata and grammar-input encoding use the actual implementation.
+All original Create/Clone and vocabulary-count assertions remain. Production
+cache code is unchanged. Failed logs/XML and synthetic shard-error accounting
+are retained; framework/package gates did not run. A complete corrected gate
+is required before acceptance.
+
+The native workflow now restores a Bazel disk cache keyed by compiler, build
+configuration and source revision, with compatible prior revisions as donors.
+Bazel's content keys invalidate changed actions; a 3 GiB garbage-collection
+policy limits the idle cache. Host, ABI and conversation tests explicitly disable
+test-result caching, so reused compilation does not substitute for execution.
+Cache restore/save failures do not bypass or fail the native acceptance gates.
+The first cache workflow at `b553f61` failed validation with zero jobs and no
+compiled/executed cases. Initialize its cache path from `RUNNER_TEMP` in the
+toolchain step; runner context is unavailable in job-level environment values.
+The failed run/check-suite metadata is retained.
+
+## Apple runtime linkage
+
+The real GuideAI tool handoff at app source `317ed4f80` crashed inside
+`CompositeLogitMask::Apply`. Independent inspection of the packaged Gemma
+provider establishes an incompatible virtual interface: its `FstConstraint`
+slot 6 returns a legacy `FstBitmap`, while the v0.17.1 runtime expects a
+`LogitMask`. The runtime's type query calls that bitmap's deleting destructor.
+The artifact's linkage, signatures and prior JSON controls did not exercise
+this native tool boundary and therefore did not establish ABI compatibility.
+
+The Apple Gemma provider pins now use upstream dependency revision
+`4453b286c549d216584866ed49b6fed6d11fa3a7` (also present at inspected upstream
+main `84d9669`). Both iOS variants expose the matching `ComputeMask` slot followed
+by `ComputeBitmap`. These are unmodified upstream binaries; no compatibility
+adapter, tool grammar or decoder fallback is added. A new native gate executes
+the real provider's float32/float16 masks and state transitions through the
+composite decoder in both Python and FC tool formats. It runs before the longer
+host gate. All original host, conversation, framework and packaging gates remain.
+
+The `59221f6` gate was canceled during compilation after this diagnosis, to
+avoid producing another known incompatible package. Its terminal job log and
+artifact are retained; no test XML was produced, and no native cases or framework
+acceptance are claimed for that canceled run. Corrected full native and device
+tool execution remain required before replacing GuideAI's current SDK pins.
+
+The pinned LiteRT dependency routes its iOS dynamic runtime to a `macos_dylib`
+target. The arm64 simulator framework consequently tried to link an x86_64 macOS
+runtime. `patches/litert_ios_runtime_import.patch` selects LiteRT-LM's pinned
+Apple runtime binary for each iOS platform. macOS and other platform routing is
+preserved. The release workflow rejects unfetched LFS pointers, wrong
+architectures, wrong Apple platforms, and a missing runtime ABI before compilation.
+
+The framework build and runtime dependency packaging still require acceptance.
+A successful link does not establish Metal plugin loading, native tool grammar,
+model accuracy, cancellation, phone memory use, or battery performance. GuideAI
+must pass those device checks before adopting the fork's binary.
+
+## Retained validation
+
+`native-byte-contract.yml` declares eleven complete tokenizer, constraint and
+execution-manager targets, then eight selected conversation-cache cases before
+building device and simulator framework slices. Host XML and logs are copied before
+switching Bazel configurations: `bazel-testlogs` otherwise points at the later
+iOS configuration. Evidence is uploaded even when a later step fails.
+
+## Complete Apple runtime artifacts
+
+`package_apple_runtime.py` produces five explicit binary artifacts: CLiteRTLM,
+LiteRtRuntime, GemmaModelConstraintProvider, LiteRtMetalAccelerator and
+LiteRtTopKMetalSampler. Every dependency has its own iOS framework and simulator
+framework, declared install name, platform metadata and checksum. Packaging
+updates only Mach-O install/load names and code signatures in copies of the pinned
+libraries. Original source/LFS objects remain unchanged. It verifies the complete
+dependency graph, architectures, platforms, C headers, required native symbols and
+signatures before retaining output. There are no nested frameworks or standalone
+third-party dylibs in the app-facing artifacts.
+
+On iOS, the sampler binds the pinned C APIs through a strong link dependency.
+The native environment receives the linked Metal accelerator definition through
+the pinned runtime's custom GPU accelerator option for GPU executors. This
+internal SDK binding preserves the actual definition's lifetime and avoids
+searching for standalone dylib filenames. Other platforms retain their existing
+runtime loading. App code gets no native handle or internal configuration API.
+
+Package verification is not model/device acceptance. SwiftPM embedding and
+signing, actual Metal execution and sampling, constrained text/tool generation,
+cancellation, full-app memory/thermal behavior and battery cost remain required
+before GuideAI adopts this SDK. The package still requires its new build gate;
+these source changes alone make no runtime acceptance claim.
+
+## Package failure diagnostics
+
+The e730273 native gate passed 105 test cases and built both framework slices,
+but `install_name_tool -id` failed during packaging. Its captured diagnostic was
+missing from the traceback, and the temporary packaging files were deleted. The
+root cause is unverified. Command failures now report the captured output and exit
+code. Failed work is retained separately with source/archive identity and an
+explicit rejection marker; the untouched Bazel framework archive is uploaded even
+on failure. Existing evidence is never replaced. This enables diagnosis of the
+actual binary without weakening any package or runtime acceptance check.
+
+## Preserve signatures until final packaging
+
+The exact 0e5e7aa gate built both slices and passed 105 native cases, but runner
+Xcode 16.4 rejected the simulator C API ID rewrite after signature removal.
+Retained headers show eight padding bytes between the string table and the old
+signature location. Removing that signature leaves those bytes at the end of
+`__LINKEDIT`. This is the observed failing tool sequence; complete binary
+validation and the runner-specific cause still require verification.
+
+Linkage changes now operate on signed copies before the existing final framework
+signing replaces their invalidated signatures. Original binaries remain intact;
+all source, platform, signature and dependency checks remain required. One real
+retained simulator copy accepted ID/dependency changes and final signing on the
+local newer Xcode. Its signature-removal output differs from the runner's, and
+both command orders succeed locally, so this is not a runner reproduction or full
+package acceptance. The first local probe's import failure and second probe's
+incorrect byte-equality assumption are retained separately. A producer control
+checks that linkage rewriting never strips signatures and still rewrites every
+required dependency. The next complete SDK gate remains required before adoption.
+
+## Processing parse errors retain the callback until task termination
+
+The callback-only host gate at `83357c4` reproduced a malformed complete tool
+fence during processing followed by more text and task completion. The original
+callback sent an immediate error, later text, and three terminal-equivalent
+packets. Its final reparse also replaced the original error's full-response
+context. The one selected regression executed and failed; its original log and
+XML are retained in workflow `37541464094`. No SDK build or package job ran.
+
+The callback now retains the first processing error until the native task reaches
+a terminal state. Further processing packets are suppressed; successful chunks
+before the error remain unchanged. Terminal delivery is guarded once, failed
+streams cannot publish completed-message history, and cancellation and token-limit
+history cleanup retain their existing policy. This changes neither task shutdown
+nor session/executor ownership and adds no public native or Swift API.
+
+The existing callback suite now includes exact first-error identity, later malformed
+input and text, six terminal task states, three native failure statuses, cancellation
+cleanup and repeated terminal delivery. A callback-only workflow dispatch runs this
+host target without building or packaging an SDK. The first complete gate at
+`2519c73` ran all 43 cases: all eleven new cases and 31 existing cases passed.
+The remaining existing malformed-call fixture expected the former immediate
+processing error without a terminal input. It now requires no processing error,
+then supplies task completion and retains its original invalid-argument rejection.
+The original 42-pass/one-failure log and XML are retained in workflow `37542163249`.
+The corrected complete suite at `2bc318c` passed all 43 cases in workflow
+`37542720114`: zero failures, errors, skips or disabled cases, and every XML case
+reports `status=run` and `result=completed`. The retained artifact SHA-256 is
+`857fb862f17cd1ebbcf77aa847bc155367e7899117bcdbb10b7f601e87bef5fb`, independently
+matched to GitHub's digest. Both prior failure archives are also retained and
+digest-verified. No SDK/framework/package stage ran. Worker joins, C/Swift
+ownership under ASan and physical-device acceptance remain separate checks.
+
+## Allocation errors finish their native task
+
+The external-sampler decoded-ID allocation error previously called the threaded
+callback directly and returned without the native task finalizer. That could
+leave an active task after the worker exited, delaying session completion.
+The error now releases the executor and uses the existing finalizer, which owns
+terminal callback delivery, dependent-task failure and active-task removal.
+
+Serial and threaded managers share one decoded-ID allocation policy. Production
+uses the same managed tensor-buffer allocation and shape; a per-manager injected
+allocator permits deterministic allocation-failure coverage without global state
+or real memory exhaustion. The new native regression runs for both managers,
+requires exactly one error, bounded task/session/pool completion, explicit release,
+and a fresh successful session on the same manager with the real allocator.
+The full existing execution-manager suite is added to the host gate. The 292dec9
+gate compiled and executed nine targets and 163 cases without skips; two fresh
+session recovery variants failed. This does not establish phone OOM, cancellation,
+memory, performance or SDK/package acceptance.
+
+The full execution-manager target previously skipped three serial variants. Its
+serial waits drive queued work and cannot interrupt an already running decode;
+the timeout controls now require the delayed task to finish, the caller to wait
+for the actual configured delay, and zero-time task/session/pool checks to succeed.
+Threaded variants retain their original exact timeout assertions. The destructor
+control runs its original pending-work/completed-callback check for both managers.
+No skipped cases are accepted. The first owned 6c8706d gate was canceled after this
+coverage issue was identified; its partial logs/results are retained, not treated
+as a native test or SDK acceptance result.
+
+That gate's injected error, callback and bounded completion checks succeeded;
+the next session failed with `Decode called without prior prefill or decode`.
+`FakeLlmExecutor::Reset` cleared its counters and decode state while retaining
+its processed-token ledger. The resource manager could then skip a cached prefix
+the fake could no longer decode. Reset now clears that stale ledger. A direct
+native regression checks repeated reset, empty processed tokens, decode refusal
+before prefill, and identical fresh prefill/decode output. The manager recovery
+test and its original assertions are unchanged. The complete fake-executor target
+joins the gate: ten targets, 175 cases, no failures, errors or skips required.
+This corrects test-executor state; it is not evidence of a phone backend failure
+or proof of fresh-session recovery until the corrected native gate executes.
+
+CMake now compiles the shared `execution_manager.cc` implementation in one static
+target linked by both derived manager targets and the resource-manager facade.
+Its prior explicit target list omitted the new implementation; the generated
+source glob only copied it. Apple Bazel compilation does not validate a complete
+CMake build, which remains a separate verification requirement.

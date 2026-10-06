@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace litert::lm {
 
@@ -39,6 +40,8 @@ enum class LlgConstraintType {
 
 struct LlGuidanceConfig {
   std::optional<uint32_t> eos_id = std::nullopt;
+  // Additional control IDs, including all configured single-token stops.
+  std::vector<int> special_token_ids;
 };
 
 struct LlGuidanceConstraintArg {

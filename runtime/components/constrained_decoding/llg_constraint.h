@@ -40,15 +40,25 @@ class LlgBitmap : public Bitmap {
 // A wrapper class to own the ::LlgConstraint* pointer from llguidance.h.
 class LlgConstraintOwner {
  public:
-  explicit LlgConstraintOwner(::LlgConstraint* llg_constraint)
-      : llg_constraint_(llg_constraint) {}
+  explicit LlgConstraintOwner(
+      ::LlgConstraint* llg_constraint,
+      std::shared_ptr<const void> tokenization_context = nullptr)
+      : llg_constraint_(llg_constraint),
+        tokenization_context_(std::move(tokenization_context)) {}
 
   ~LlgConstraintOwner() { llg_free_constraint(llg_constraint_); }
 
   ::LlgConstraint* llg_constraint() const { return llg_constraint_; }
 
+  const std::shared_ptr<const void>& tokenization_context() const {
+    return tokenization_context_;
+  }
+
  private:
   ::LlgConstraint* llg_constraint_;  // Owned.
+  // The native parser can invoke its tokenizer after its provider is gone.
+  // Keep callback metadata alive through every cloned constraint/state.
+  const std::shared_ptr<const void> tokenization_context_;
 };
 
 // Represents a decoding constraint based on the LLGuidance library.
@@ -57,13 +67,20 @@ class LlgConstraint : public Constraint {
   class LlgState : public State {
    public:
     // LlgState takes ownership of llg_constraint.
-    explicit LlgState(::LlgConstraint* llg_constraint) {
+    explicit LlgState(
+        ::LlgConstraint* llg_constraint,
+        std::shared_ptr<const void> tokenization_context = nullptr) {
       llg_constraint_owner_ =
-          std::make_shared<LlgConstraintOwner>(llg_constraint);
+          std::make_shared<LlgConstraintOwner>(
+              llg_constraint, std::move(tokenization_context));
     }
 
     ::LlgConstraint* llg_constraint() const {
       return llg_constraint_owner_->llg_constraint();
+    }
+
+    const std::shared_ptr<const void>& tokenization_context() const {
+      return llg_constraint_owner_->tokenization_context();
     }
 
    private:
@@ -73,8 +90,9 @@ class LlgConstraint : public Constraint {
 
   // LlgConstraint takes ownership of llg_constraint.
   explicit LlgConstraint(::LlgConstraint* llg_constraint, int vocab_size,
-                         int eos_token_id)
-      : llg_constraint_owner_(llg_constraint),
+                         int eos_token_id,
+                         std::shared_ptr<const void> tokenization_context = nullptr)
+      : llg_constraint_owner_(llg_constraint, std::move(tokenization_context)),
         vocab_size_(vocab_size),
         eos_token_id_(eos_token_id) {}
 

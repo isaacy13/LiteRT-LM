@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_SUPPORT_TOKENIZER_SENTENCEPIECE_TOKENIZER_H_
 #define THIRD_PARTY_ODML_LITERT_LM_SUPPORT_TOKENIZER_SENTENCEPIECE_TOKENIZER_H_
 
+#include <array>
 #include <memory>
 #include <string>
 #include <utility>
@@ -65,6 +66,12 @@ class SentencePieceTokenizer : public Tokenizer {
   // Returns the tokens in the SentencePiece model.
   std::vector<std::string> GetTokens() const override;
 
+  ConstraintVocabulary GetConstraintVocabulary() const override;
+
+  absl::StatusOr<TokenIds> BytesToTokenIdsForConstraint(
+      absl::string_view bytes,
+      absl::Span<const int> excluded_token_ids = {}) override;
+
   // Returns the size of the vocabulary.
   int GetVocabSize() const override;
 
@@ -75,9 +82,7 @@ class SentencePieceTokenizer : public Tokenizer {
  private:
   // Constructor.
   explicit SentencePieceTokenizer(
-      std::unique_ptr<sentencepiece::SentencePieceProcessor> processor)
-      : processor_(std::move(processor)),
-        vocab_size_(processor_->GetPieceSize()) {};
+      std::unique_ptr<sentencepiece::SentencePieceProcessor> processor);
 
   // SentencePiece processor.
   std::unique_ptr<sentencepiece::SentencePieceProcessor> processor_;
@@ -85,6 +90,7 @@ class SentencePieceTokenizer : public Tokenizer {
   // The size of the vocabulary. Used to avoid decoding the invalid IDs that are
   // out of the range of the vocabulary.
   int vocab_size_;
+  std::array<int, 256> byte_token_ids_;
 };
 
 }  // namespace litert::support
