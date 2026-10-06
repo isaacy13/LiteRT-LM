@@ -13,14 +13,20 @@ remaining host, conversation, framework and package gates were not executed.
 The complete terminal log, test XML and artifact are retained. Compilation cache
 save succeeded; this cold ABI build used 4,501 actions and approximately 20 minutes.
 
-The FC ABI fixture now appends its four required USER_DEFINED marker pieces to a
-copy of that fixture's model proto. It preserves all existing pieces and IDs and
-recreates the actual SentencePiece tokenizer from the extended proto. Provider
-and tokenizer receive the same complete vocabulary. The Python fixture stays
-unchanged. All four original mask, vocabulary and state-advancement assertions
-remain required. This exercises the provider ABI with valid FC marker IDs; it
-does not claim Gemma 4 sampling or physical-device acceptance. The three upstream
-Gemma library pins and production decoder code are unchanged.
+The subsequent `b53c0c1` gate rejected the extended FC vocabulary during provider
+creation as unsupported. Both Python cases passed; no FC mask or later gate ran.
+The complete failure evidence is retained. A small independent C API probe then
+successfully created providers and constraints using both unmodified upstream
+fixtures: Gemma 3 for Python and FunctionGemma for FC. Creation alone does not
+establish mask or state compatibility.
+
+The FC ABI test now uses the existing `function_gemma_sentencepiece.model` and
+its native `<start_function_call>`, `<end_function_call>`, `<escape>` and
+`<start_function_response>` markers. No vocabulary is fabricated or extended.
+The Python fixture and all four original mask, vocabulary and state-advancement
+assertions remain. Full native gates must execute before acceptance. These public
+fixtures do not establish Gemma 4 sampling or physical-device acceptance. The
+three upstream Gemma library pins and production decoder code are unchanged.
 
 The constraint vocabulary preserves decoded bytes and tokenizer control metadata.
 SentencePiece grammar-input encoding uses ordinary token IDs only when their
