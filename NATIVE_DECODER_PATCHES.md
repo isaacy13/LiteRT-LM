@@ -224,8 +224,13 @@ The remaining existing malformed-call fixture expected the former immediate
 processing error without a terminal input. It now requires no processing error,
 then supplies task completion and retains its original invalid-argument rejection.
 The original 42-pass/one-failure log and XML are retained in workflow `37542163249`.
-The corrected complete suite is pending execution; worker joins, C/Swift ownership
-under ASan and physical-device acceptance are not established by these fixtures.
+The corrected complete suite at `2bc318c` passed all 43 cases in workflow
+`37542720114`: zero failures, errors, skips or disabled cases, and every XML case
+reports `status=run` and `result=completed`. The retained artifact SHA-256 is
+`857fb862f17cd1ebbcf77aa847bc155367e7899117bcdbb10b7f601e87bef5fb`, independently
+matched to GitHub's digest. Both prior failure archives are also retained and
+digest-verified. No SDK/framework/package stage ran. Worker joins, C/Swift
+ownership under ASan and physical-device acceptance remain separate checks.
 
 ## Allocation errors finish their native task
 
