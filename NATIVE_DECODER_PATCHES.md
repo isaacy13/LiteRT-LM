@@ -59,7 +59,37 @@ cache code is unchanged. Failed logs/XML and synthetic shard-error accounting
 are retained; framework/package gates did not run. A complete corrected gate
 is required before acceptance.
 
+The native workflow now restores a Bazel disk cache keyed by compiler, build
+configuration and source revision, with compatible prior revisions as donors.
+Bazel's content keys invalidate changed actions; a 3 GiB garbage-collection
+policy limits the idle cache. Host, ABI and conversation tests explicitly disable
+test-result caching, so reused compilation does not substitute for execution.
+Cache restore/save failures do not bypass or fail the native acceptance gates.
+
 ## Apple runtime linkage
+
+The real GuideAI tool handoff at app source `317ed4f80` crashed inside
+`CompositeLogitMask::Apply`. Independent inspection of the packaged Gemma
+provider establishes an incompatible virtual interface: its `FstConstraint`
+slot 6 returns a legacy `FstBitmap`, while the v0.17.1 runtime expects a
+`LogitMask`. The runtime's type query calls that bitmap's deleting destructor.
+The artifact's linkage, signatures and prior JSON controls did not exercise
+this native tool boundary and therefore did not establish ABI compatibility.
+
+The Apple Gemma provider pins now use upstream dependency revision
+`4453b286c549d216584866ed49b6fed6d11fa3a7` (also present at inspected upstream
+main `84d9669`). Both iOS variants expose the matching `ComputeMask` slot followed
+by `ComputeBitmap`. These are unmodified upstream binaries; no compatibility
+adapter, tool grammar or decoder fallback is added. A new native gate executes
+the real provider's float32/float16 masks and state transitions through the
+composite decoder in both Python and FC tool formats. It runs before the longer
+host gate. All original host, conversation, framework and packaging gates remain.
+
+The `59221f6` gate was canceled during compilation after this diagnosis, to
+avoid producing another known incompatible package. Its terminal job log and
+artifact are retained; no test XML was produced, and no native cases or framework
+acceptance are claimed for that canceled run. Corrected full native and device
+tool execution remain required before replacing GuideAI's current SDK pins.
 
 The pinned LiteRT dependency routes its iOS dynamic runtime to a `macos_dylib`
 target. The arm64 simulator framework consequently tried to link an x86_64 macOS

@@ -21,6 +21,24 @@ package(
 
 licenses(["notice"])
 
+cc_test(
+    name = "gemma_tool_constraint_abi_test",
+    srcs = ["gemma_tool_constraint_abi_test.cc"],
+    data = ["//runtime/components/testdata:testdata"],
+    deps = [
+        ":composite_constraint",
+        ":constrained_decoder",
+        ":constraint",
+        ":gemma_model_constraint_provider_lib",
+        "//runtime/util:test_utils",
+        "//support/tokenizer:sentencepiece_tokenizer",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+        "@litert//litert/cc:litert_layout",
+        "@litert//tflite/types:half",
+    ],
+)
+
 cc_library(
     name = "bitmap",
     hdrs = ["bitmap.h"],

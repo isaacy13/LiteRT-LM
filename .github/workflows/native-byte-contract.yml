@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 180
     env:
       GIT_LFS_SKIP_SMUDGE: '1'
+      BAZEL_DISK_CACHE: ${{ runner.temp }}/guideai-native-bazel-cache
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -32,14 +33,40 @@ jobs:
           curl -fL --retry 3 -o "$RUNNER_TEMP/bazelisk" https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-darwin-arm64
           echo 'cee851f726789227d5561004e9904a52be45c3efb56f8b38b6993d6adbaa0409  '"$RUNNER_TEMP/bazelisk" | shasum -a 256 -c -
           chmod +x "$RUNNER_TEMP/bazelisk"
+      - name: Identify native compiler cache
+        id: native-toolchain
+        run: |
+          native_toolchain_fingerprint=$( { xcodebuild -version; xcrun clang --version; } | shasum -a 256 | cut -d ' ' -f 1)
+          echo "fingerprint=$native_toolchain_fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Restore native compilation cache
+        id: native-cache
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.BAZEL_DISK_CACHE }}
+          key: native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-${{ github.sha }}
+          restore-keys: |
+            native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-
       - name: Verify pinned Apple runtime slices
         run: python3 tools/verify_apple_prebuilt_runtime.py
       - name: Package closure rejection controls
         run: python3 tools/package_apple_runtime_test.py
+      - name: Native Gemma tool provider ABI
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --nocache_test_results --test_output=all --verbose_failures \
+            //runtime/components/constrained_decoding:gemma_tool_constraint_abi_test \
+            2>&1 | tee native-gemma-tool-abi-tests.log
       - name: Native tokenizer and constraint regressions
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s --nocache_test_results \
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             --test_output=all --keep_going --verbose_failures \
             //support/tokenizer:sentencepiece_tokenizer_test \
@@ -58,6 +85,8 @@ jobs:
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s --nocache_test_results \
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             --test_output=all --verbose_failures \
             --test_filter='*EngineConstraintProvider*' \
@@ -73,6 +102,8 @@ jobs:
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             //swift:CLiteRTLM 2>&1 | tee native-framework.log
       - name: Package and verify the Apple runtime dependency graph
@@ -86,6 +117,7 @@ jobs:
         with:
           name: native-byte-contract-${{ github.sha }}
           path: |
+            native-gemma-tool-abi-tests.log
             native-tests.log
             native-conversation-cache-tests.log
             native-framework.log
@@ -95,3 +127,10 @@ jobs:
             bazel-bin/swift/CLiteRTLM.xcframework.zip
             native-test-results/
           if-no-files-found: warn
+      - name: Save native compilation cache
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.BAZEL_DISK_CACHE }}
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
