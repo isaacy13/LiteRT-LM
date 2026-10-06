@@ -26,6 +26,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "runtime/components/constrained_decoding/constraint_provider_cache.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "support/tokenizer/tokenizer.h"
@@ -374,6 +375,14 @@ class EngineT {
   // Get the reference to the tokenizer for the engine.
   virtual const support::Tokenizer& GetTokenizer() const = 0;
 
+  // Reuse the engine's immutable constraint vocabulary. Each conversation
+  // still creates independent grammars, parser states and callback ownership.
+  absl::StatusOr<std::shared_ptr<const ConstraintProvider>> GetConstraintProvider(
+      const ConstraintProviderConfig& config,
+      const std::vector<std::vector<int>>& stop_token_ids) const {
+    return constraint_providers_.Get(config, GetTokenizer(), stop_token_ids);
+  }
+
   // Get the audio model properties for the session. This is only available
   // if the engine is created with audio modality enabled.
   virtual absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
@@ -406,6 +415,12 @@ class EngineT {
 
   // Default timeout duration for the engine/session processes.
   static constexpr absl::Duration kDefaultTimeout = absl::Minutes(10);
+
+ protected:
+  void ClearConstraintProviderCache() const { constraint_providers_.Clear(); }
+
+ private:
+  mutable ConstraintProviderCache constraint_providers_;
 };
 
 // Default Engine implementation using the standard SessionInterface.

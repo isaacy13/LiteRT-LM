@@ -39,7 +39,6 @@
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/constraint_provider_config.h"
-#include "runtime/components/constrained_decoding/constraint_provider_factory.h"
 #include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
 #include "runtime/components/constrained_decoding/repetition_penalty_config.h"
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
@@ -435,12 +434,12 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
                                session->GetSessionConfig().GetStopTokenIds(),
                                config.constrained_decoding_enabled(),
                                config.GetPromptTemplate().GetCapabilities()));
-  std::unique_ptr<ConstraintProvider> constraint_provider;
+  std::shared_ptr<const ConstraintProvider> constraint_provider;
   if (config.constraint_provider_config().has_value()) {
     ABSL_ASSIGN_OR_RETURN(
         constraint_provider,
-        CreateConstraintProvider(
-            config.constraint_provider_config().value(), engine.GetTokenizer(),
+        engine.GetConstraintProvider(
+            config.constraint_provider_config().value(),
             session->GetSessionConfig().GetStopTokenIds()));
   }
   auto conversation = absl::WrapUnique(new Conversation(
@@ -887,12 +886,11 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Clone() {
   if (!status.ok() && !absl::IsUnimplemented(status)) {
     return status;
   }
-  std::unique_ptr<ConstraintProvider> constraint_provider;
+  std::shared_ptr<const ConstraintProvider> constraint_provider;
   if (config_.constraint_provider_config().has_value()) {
     ABSL_ASSIGN_OR_RETURN(constraint_provider,
-                          CreateConstraintProvider(
+                          engine_.GetConstraintProvider(
                               config_.constraint_provider_config().value(),
-                              engine_.GetTokenizer(),
                               session->GetSessionConfig().GetStopTokenIds()));
   }
   auto new_conversation = absl::WrapUnique(new Conversation(

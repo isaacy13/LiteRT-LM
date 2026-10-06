@@ -13,6 +13,29 @@ metadata remains owned by constraints and cloned states. Each committed token
 advances an independent parser clone so speculative rejection preserves earlier
 grammar positions and a failed commit cannot poison its input state.
 
+## Engine ownership of the constraint vocabulary
+
+Conversation creation and cloning now obtain their LLGuidance provider from the
+engine. One mutex-protected entry retains the immutable vocabulary, keyed by
+tokenizer identity, explicit EOS, configured special IDs and the exact ordered
+stop sequences. A changed key replaces that entry; failed initialization preserves
+the prior valid provider. Existing conversations retain their provider, and each
+grammar and parser state is still created independently. External providers retain
+their existing per-conversation ownership and do not evict the vocabulary.
+
+The engine clears its cache before tearing down its tokenizer. Native constraints
+still require their engine's tokenizer to remain alive. There is no global cache,
+unbounded configuration map, cached conversation or shared parser state.
+
+Ten controls exercise the actual engine API: repeated vocabulary construction,
+stop/EOS/special-ID and tokenizer changes, separate engines, failure preservation,
+external providers, retained parsers after eviction/clear and concurrent creation.
+Two conversation controls (four existing configurations each) count real
+SentencePiece vocabulary construction through actual Create and Clone paths.
+Both Bazel and CMake describe the cache dependency. Native build/package gates,
+actual model semantics and physical initialization/RAM/energy measurements remain
+required; source changes alone establish no device performance improvement.
+
 ## Apple runtime linkage
 
 The pinned LiteRT dependency routes its iOS dynamic runtime to a `macos_dylib`
@@ -29,8 +52,9 @@ must pass those device checks before adopting the fork's binary.
 
 ## Retained validation
 
-`native-byte-contract.yml` runs nine tokenizer, constraint and execution-manager targets, then
-builds device and simulator framework slices. Host XML and logs are copied before
+`native-byte-contract.yml` declares eleven complete tokenizer, constraint and
+execution-manager targets, then eight selected conversation-cache cases before
+building device and simulator framework slices. Host XML and logs are copied before
 switching Bazel configurations: `bazel-testlogs` otherwise points at the later
 iOS configuration. Evidence is uploaded even when a later step fails.
 

@@ -677,7 +677,7 @@ class Conversation {
       Engine& engine, std::unique_ptr<Engine::Session> session,
       std::unique_ptr<ModelDataProcessor> model_data_processor, Preface preface,
       PromptTemplate prompt_template, ConversationConfig config,
-      std::unique_ptr<ConstraintProvider> constraint_provider = nullptr)
+      std::shared_ptr<const ConstraintProvider> constraint_provider = nullptr)
       : engine_(engine),
         model_data_processor_(std::move(model_data_processor)),
         preface_(preface),
@@ -784,7 +784,7 @@ class Conversation {
   // if any.
   std::unique_ptr<Constraint> constraint_;
   const ConversationConfig config_;
-  std::unique_ptr<ConstraintProvider> constraint_provider_ = nullptr;
+  std::shared_ptr<const ConstraintProvider> constraint_provider_ = nullptr;
   mutable absl::Mutex history_mutex_;
   std::vector<Message> history_ ABSL_GUARDED_BY(history_mutex_);
 

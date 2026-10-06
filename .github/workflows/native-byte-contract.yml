@@ -46,6 +46,7 @@ jobs:
             //support/tokenizer:huggingface_tokenizer_test \
             //runtime/components/constrained_decoding:constraint_vocabulary_test \
             //runtime/components/constrained_decoding:constraint_provider_factory_test \
+            //runtime/components/constrained_decoding:constraint_provider_cache_test \
             //runtime/components/constrained_decoding:llg_constraint_provider_test \
             //runtime/components/constrained_decoding:llg_constraint_test \
             //runtime/components/constrained_decoding:llg_fc_tool_calls_test \
@@ -53,6 +54,15 @@ jobs:
             //runtime/executor:fake_llm_executor_test \
             //runtime/framework/resource_management:execution_manager_test \
             2>&1 | tee native-tests.log
+      - name: Native conversation cache integration
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --test_output=all --verbose_failures \
+            --test_filter='*EngineConstraintProvider*' \
+            //runtime/conversation:conversation_test \
+            2>&1 | tee native-conversation-cache-tests.log
       - name: Preserve host test results before changing platforms
         if: always()
         run: |
@@ -77,6 +87,7 @@ jobs:
           name: native-byte-contract-${{ github.sha }}
           path: |
             native-tests.log
+            native-conversation-cache-tests.log
             native-framework.log
             native-package.log
             native-artifact/

@@ -106,6 +106,7 @@ class EngineAdvancedImpl : public Engine {
     }
 
     execution_manager_.reset();
+    ClearConstraintProviderCache();
     owned_env_.reset();
     tokenizer_.reset();
     litert_model_resources_.reset();

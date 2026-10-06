@@ -509,6 +509,46 @@ cc_test(
 )
 
 cc_library(
+    name = "constraint_provider_cache",
+    srcs = ["constraint_provider_cache.cc"],
+    hdrs = ["constraint_provider_cache.h"],
+    deps = [
+        ":constraint_provider",
+        ":constraint_provider_config",
+        ":constraint_provider_factory",
+        ":llg_constraint_config",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "//support/tokenizer",
+    ],
+)
+
+cc_test(
+    name = "constraint_provider_cache_test",
+    srcs = ["constraint_provider_cache_test.cc"],
+    deps = [
+        ":constraint",
+        ":constraint_provider",
+        ":constraint_provider_config",
+        ":external_constraint_config",
+        ":llg_constraint_config",
+        ":logit_mask",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "thinking_budget_constraint",
     srcs = ["thinking_budget_constraint.cc"],
     hdrs = ["thinking_budget_constraint.h"],
