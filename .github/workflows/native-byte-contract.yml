@@ -78,6 +78,7 @@ jobs:
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
             //runtime/framework/resource_management:scheduling_lifetime_test \
+            //runtime/framework/resource_management:fanout_lifetime_test \
             //runtime/framework:threadpool_test \
             2>&1 | tee native-scheduling-tests.log
       - name: Native Gemma tool provider ABI
@@ -131,6 +132,7 @@ jobs:
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
             //c:engine_stream_terminal_test \
+            //c:engine_stream_fanout_lifetime_test \
             2>&1 | tee native-c-stream-terminal-tests.log
       - name: Preserve host test results before changing platforms
         if: always()

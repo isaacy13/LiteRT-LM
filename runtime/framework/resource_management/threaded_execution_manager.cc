@@ -485,7 +485,7 @@ absl::Status ThreadedExecutionManager::FinishTask(
   bool terminal_callback_scheduled = false;
   absl::Status terminal_schedule_status;
   std::vector<absl::AnyInvocable<void() &&>> failed_dependent_callbacks;
-  absl::flat_hash_set<TaskId> deferred_failed_task_ids;
+  absl::flat_hash_set<TaskId> deferred_unstarted_task_ids;
   std::shared_ptr<absl::Notification> failed_dependencies_drained;
   struct FailureDrain {
     std::vector<absl::AnyInvocable<void() &&>>& callbacks;
@@ -497,14 +497,26 @@ absl::Status ThreadedExecutionManager::FinishTask(
       for (auto& callback : callbacks) std::move(callback)();
       if (signal != nullptr) signal->Notify();
     }
+    absl::AnyInvocable<void() &&>& terminal;
+    const bool& terminal_scheduled;
     // Every return leaves the lookup-lock scope before this owner is destroyed.
-    ~FailureDrain() { Run(); }
-  } failure_drain{failed_dependent_callbacks, failed_dependencies_drained};
-  auto defer_failed_task =
-      [&](TaskId failed_id, absl::Status status, TaskState end_state)
+    // A refused terminal start never enqueued/consumed this callable. Retain
+    // that same accepted completion even if a later graph check returns early.
+    ~FailureDrain() {
+      Run();
+      if (!terminal_scheduled && terminal != nullptr) {
+        auto completion = std::move(terminal);
+        std::move(completion)();
+      }
+    }
+  } failure_drain{failed_dependent_callbacks, failed_dependencies_drained,
+                  false, terminal_callback, terminal_callback_scheduled};
+  auto defer_unstarted_task =
+      [&](TaskId failed_id, absl::StatusOr<Responses> result,
+          TaskState end_state)
           ABSL_EXCLUSIVE_LOCKS_REQUIRED(session_and_task_lookup_mutex_)
               -> absl::Status {
-    if (deferred_failed_task_ids.contains(failed_id)) {
+    if (deferred_unstarted_task_ids.contains(failed_id)) {
       return absl::OkStatus();
     }
     auto found = task_lookup_.find(failed_id);
@@ -520,18 +532,37 @@ absl::Status ThreadedExecutionManager::FinishTask(
           "Refused dependent task ", failed_id,
           " does not own an unstarted callback."));
     }
+    // Validate remaining reverse edges before transferring the sole callback.
+    // A held terminal child is no longer a waiting follower of another live
+    // predecessor. That predecessor must not validate it as a Created task.
+    for (TaskId dependency_id : failed.dependent_tasks) {
+      if (!task_lookup_.contains(dependency_id) ||
+          !task_lookup_.at(dependency_id).following_tasks.contains(failed_id)) {
+        return absl::FailedPreconditionError(absl::StrCat(
+            "Dependent task ", failed_id,
+            " has no reciprocal edge from task ", dependency_id));
+      }
+    }
     // Perform the only fallible state transition before moving the callable.
     // The lookup mutex keeps this exact record present throughout the transfer.
     ABSL_RETURN_IF_ERROR(
         UpdateTaskState(failed_id, TaskState::kLastCallbackQueued));
     failed.cancelled->store(true);
+    for (TaskId dependency_id : failed.dependent_tasks) {
+      task_lookup_.at(dependency_id).following_tasks.erase(failed_id);
+    }
     failed.dependent_tasks.clear();
     failed.completion_state_after_callback = end_state;
     auto failed_callback = std::move(failed.callback);
     failed_dependent_callbacks.emplace_back(
-        [failed_callback = std::move(failed_callback), failed_id, status,
-         end_state, this]() mutable {
-          failed_callback(status);
+        [failed_callback = std::move(failed_callback), failed_id,
+         result = std::move(result), end_state, this]() mutable {
+          // Retire callback-owned captures outside the lookup mutex, before
+          // publishing the native end state and releasing its return fence.
+          {
+            auto completion = std::move(failed_callback);
+            completion(std::move(result));
+          }
           absl::MutexLock lock(session_and_task_lookup_mutex_);
           auto state_status = UpdateTaskState(failed_id, end_state);
           if (!state_status.ok()) {
@@ -541,14 +572,31 @@ absl::Status ThreadedExecutionManager::FinishTask(
         });
     // This ID now denotes a callable retained by this completion owner's
     // FailureDrain, not merely a visited graph node.
-    deferred_failed_task_ids.insert(failed_id);
+    deferred_unstarted_task_ids.insert(failed_id);
     return absl::OkStatus();
   };
-  auto invoke_callback_and_return =
+  auto defer_callback_and_return =
       [&](absl::Status status) ABSL_EXCLUSIVE_LOCKS_REQUIRED(
           session_and_task_lookup_mutex_) -> absl::Status {
-    callback(status);
-    ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, TaskState::kFailed));
+    auto& task = task_lookup_.at(task_id);
+    if (!IsTaskEndState(task.task_state)) {
+      ABSL_RETURN_IF_ERROR(
+          UpdateTaskState(task_id, TaskState::kLastCallbackQueued));
+      task.completion_state_after_callback = TaskState::kFailed;
+    }
+    failed_dependent_callbacks.emplace_back(
+        [callback = std::move(callback), task_id, status, this]() mutable {
+          {
+            auto completion = std::move(callback);
+            completion(status);
+          }
+          absl::MutexLock lock(session_and_task_lookup_mutex_);
+          auto state_status = UpdateTaskState(task_id, TaskState::kFailed);
+          if (!state_status.ok()) {
+            ABSL_LOG(ERROR) << "Failed to finish task error callback: "
+                            << state_status;
+          }
+        });
     return status;
   };
   {
@@ -560,32 +608,35 @@ absl::Status ThreadedExecutionManager::FinishTask(
     if (task_lookup_.at(task_id).task_state != TaskState::kProcessing) {
       auto error_status = absl::FailedPreconditionError(
           absl::StrCat("Task ", task_id, " is not in Processing state."));
-      return invoke_callback_and_return(error_status);
+      return defer_callback_and_return(error_status);
     }
     if (!responses.ok() || responses->GetTaskState() == TaskState::kCancelled) {
       auto following_waiting_tasks = FollowingWaitingTasks(task_id);
       if (!following_waiting_tasks.ok()) {
-        return invoke_callback_and_return(following_waiting_tasks.status());
+        return defer_callback_and_return(following_waiting_tasks.status());
       }
-      auto status = UpdateAllTasksToState(
-          following_waiting_tasks.value(),
+      const TaskState dependent_state =
           responses.ok() ? TaskState::kDependentTaskCancelled
-                         : TaskState::kDependentTaskFailed);
-      if (!status.ok()) {
-        return invoke_callback_and_return(status);
+                         : TaskState::kDependentTaskFailed;
+      for (TaskId dependent_id : *following_waiting_tasks) {
+        auto status = defer_unstarted_task(
+            dependent_id, Responses(dependent_state), dependent_state);
+        if (!status.ok()) return defer_callback_and_return(status);
       }
     } else if (responses->GetTaskState() == TaskState::kDone ||
                responses->GetTaskState() == TaskState::kMaxNumTokensReached) {
-      for (TaskId following_task_id :
-           task_lookup_.at(task_id).following_tasks) {
+      // Terminal transfers detach reverse edges from other predecessors.
+      // Iterate a snapshot so those legitimate removals cannot invalidate us.
+      const auto following_tasks = task_lookup_.at(task_id).following_tasks;
+      for (TaskId following_task_id : following_tasks) {
         if (!task_lookup_.contains(following_task_id)) {
           auto error_status = absl::InvalidArgumentError(
               absl::StrCat("Following task ", following_task_id,
                            " not found in task list."));
-          return invoke_callback_and_return(error_status);
+          return defer_callback_and_return(error_status);
         }
         if (IsTaskEndState(task_lookup_.at(following_task_id).task_state) ||
-            deferred_failed_task_ids.contains(following_task_id)) {
+            deferred_unstarted_task_ids.contains(following_task_id)) {
           continue;
         }
         if (task_lookup_.at(following_task_id).task_state !=
@@ -594,14 +645,14 @@ absl::Status ThreadedExecutionManager::FinishTask(
               absl::StrCat("Following task ", following_task_id,
                            " is not in Created state. Task state: ",
                            task_lookup_.at(following_task_id).task_state));
-          return invoke_callback_and_return(error_status);
+          return defer_callback_and_return(error_status);
         }
         if (!task_lookup_.at(following_task_id)
                  .dependent_tasks.contains(task_id)) {
           auto error_status = absl::InvalidArgumentError(
               absl::StrCat("Following task ", following_task_id,
                            " does not depend on task ", task_id));
-          return invoke_callback_and_return(error_status);
+          return defer_callback_and_return(error_status);
         }
         task_lookup_.at(following_task_id).dependent_tasks.erase(task_id);
         if (task_lookup_.at(following_task_id).dependent_tasks.empty()) {
@@ -610,21 +661,28 @@ absl::Status ThreadedExecutionManager::FinishTask(
             // This task's start was already accepted while it waited on a
             // dependency. Refusal must finish that callback chain once rather
             // than abandon it or report failure only to its predecessor.
-            ABSL_ASSIGN_OR_RETURN(
-                auto dependent_tasks,
-                FollowingWaitingTasks(following_task_id,
-                                      &deferred_failed_task_ids));
-            for (TaskId dependent_id : dependent_tasks) {
-              ABSL_RETURN_IF_ERROR(defer_failed_task(
-                  dependent_id, status, TaskState::kDependentTaskFailed));
+            auto dependent_tasks = FollowingWaitingTasks(
+                following_task_id, &deferred_unstarted_task_ids);
+            if (!dependent_tasks.ok()) {
+              return defer_callback_and_return(dependent_tasks.status());
             }
-            ABSL_RETURN_IF_ERROR(defer_failed_task(
-                following_task_id, status, TaskState::kFailed));
+            for (TaskId dependent_id : *dependent_tasks) {
+              auto completion_status = defer_unstarted_task(
+                  dependent_id, status, TaskState::kDependentTaskFailed);
+              if (!completion_status.ok()) {
+                return defer_callback_and_return(completion_status);
+              }
+            }
+            auto completion_status = defer_unstarted_task(
+                following_task_id, status, TaskState::kFailed);
+            if (!completion_status.ok()) {
+              return defer_callback_and_return(completion_status);
+            }
           }
         }
       }
     } else if (!IsTaskEndState(responses->GetTaskState())) {
-      return invoke_callback_and_return(absl::InvalidArgumentError(absl::StrCat(
+      return defer_callback_and_return(absl::InvalidArgumentError(absl::StrCat(
           "Expected task state for responses to be end state, but got ",
           responses->GetTaskState())));
     }
@@ -653,7 +711,10 @@ absl::Status ThreadedExecutionManager::FinishTask(
           TaskState next_task_state = terminal_result->ok()
                                           ? (*terminal_result)->GetTaskState()
                                           : TaskState::kFailed;
-          callback(std::move(*terminal_result));
+          {
+            auto completion = std::move(callback);
+            completion(std::move(*terminal_result));
+          }
           absl::MutexLock lock(session_and_task_lookup_mutex_);
           auto status = UpdateTaskState(task_id, next_task_state);
           if (!status.ok()) {
@@ -695,7 +756,7 @@ absl::Status ThreadedExecutionManager::FinishTask(
           // An already running callback owns its own completion; do not copy it.
           continue;
         }
-        ABSL_RETURN_IF_ERROR(defer_failed_task(
+        ABSL_RETURN_IF_ERROR(defer_unstarted_task(
             dependent_id, terminal_schedule_status,
             TaskState::kDependentTaskFailed));
       }
@@ -713,7 +774,8 @@ absl::Status ThreadedExecutionManager::FinishTask(
     // this accepted task's terminal scheduling error once, outside the lookup
     // mutex. It marks kFailed after callback return, suppressing tool work.
     // No new worker or task is created for the refused completion.
-    std::move(terminal_callback)();
+    auto completion = std::move(terminal_callback);
+    std::move(completion)();
     return terminal_schedule_status;
   }
 
@@ -765,7 +827,10 @@ ThreadedExecutionManager::FollowingWaitingTasks(
           owned.callback != nullptr ||
           (owned.completion_state_after_callback != TaskState::kFailed &&
            owned.completion_state_after_callback !=
-               TaskState::kDependentTaskFailed) ||
+               TaskState::kDependentTaskFailed &&
+           owned.completion_state_after_callback != TaskState::kCancelled &&
+           owned.completion_state_after_callback !=
+               TaskState::kDependentTaskCancelled) ||
           session == session_lookup_.end() ||
           !session->second->active_tasks.contains(following_task_id)) {
         return absl::FailedPreconditionError(absl::StrCat(
@@ -805,27 +870,14 @@ absl::Status ThreadedExecutionManager::UpdateTaskState(TaskId task_id,
     } else {
       auto error_status = absl::InternalError(absl::StrCat(
           "Task ", task_id, " is not in active tasks of session ", session_id));
-      if (task_lookup_.at(task_id).callback != nullptr) {
-        task_lookup_.at(task_id).callback(error_status);
-      }
+      // State bookkeeping never invokes user code while holding the lookup
+      // mutex. The existing completion owner reports this error outside it.
       return error_status;
     }
   }
   task_lookup_.at(task_id).task_state = task_state;
   if (IsTaskEndState(task_state)) {
     task_lookup_.at(task_id).completion_state_after_callback.reset();
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ThreadedExecutionManager::UpdateAllTasksToState(
-    const absl::flat_hash_set<TaskId>& task_ids, TaskState task_state) {
-  for (TaskId task_id : task_ids) {
-    task_lookup_.at(task_id).dependent_tasks.clear();
-    if (task_lookup_.at(task_id).callback) {
-      task_lookup_.at(task_id).callback(Responses(task_state));
-    }
-    ABSL_RETURN_IF_ERROR(UpdateTaskState(task_id, task_state));
   }
   return absl::OkStatus();
 }

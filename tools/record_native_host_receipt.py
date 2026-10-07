@@ -16,6 +16,7 @@ SOURCE_PATHS = [
     'runtime/framework/resource_management/threaded_execution_manager.cc',
     'runtime/framework/resource_management/BUILD',
     'runtime/framework/resource_management/scheduling_lifetime_test.cc',
+    'runtime/framework/resource_management/fanout_lifetime_test.cc',
     'support/tokenizer/sentencepiece_tokenizer_test.cc',
     'support/tokenizer/huggingface_tokenizer_test.cc',
     'runtime/components/constrained_decoding/constraint_vocabulary_test.cc',
@@ -32,6 +33,7 @@ SOURCE_PATHS = [
     'runtime/conversation/conversation_test.cc',
     'runtime/framework/threadpool_test.cc',
     'c/engine.cc', 'c/BUILD', 'c/engine_stream_terminal_test.cc',
+    'c/engine_stream_fanout_lifetime_test.cc',
 ]
 
 def main():
