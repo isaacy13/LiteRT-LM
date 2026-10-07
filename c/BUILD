@@ -431,3 +431,34 @@ cc_binary(
         "//conditions:default": [],
     }),
 )
+
+# Raw C-stream terminal delivery using actual native SessionAdvanced owners.
+cc_test(
+    name = "engine_stream_terminal_test",
+    srcs = ["engine_stream_terminal_test.cc"],
+    tags = ["requires-mac-inputs:hard"],
+    deps = [
+        ":engine_headers",
+        ":engine_internal",
+        ":engine_lite_cpu",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "//runtime/core:session_advanced",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:fake_llm_executor",
+        "//runtime/executor:llm_executor_io_types",
+        "//runtime/framework/resource_management:execution_manager",
+        "//runtime/framework/resource_management:threaded_execution_manager",
+        "//runtime/proto:llm_metadata_cc_proto",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+    ],
+)

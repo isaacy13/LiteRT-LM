@@ -31,6 +31,7 @@ SOURCE_PATHS = [
     'runtime/conversation/internal_callback_util_test.cc',
     'runtime/conversation/conversation_test.cc',
     'runtime/framework/threadpool_test.cc',
+    'c/engine.cc', 'c/BUILD', 'c/engine_stream_terminal_test.cc',
 ]
 
 def main():

@@ -122,6 +122,16 @@ jobs:
             --test_filter='*EngineConstraintProvider*' \
             //runtime/conversation:conversation_test \
             2>&1 | tee native-conversation-cache-tests.log
+      - name: Native C stream terminal controls
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
+            //c:engine_stream_terminal_test \
+            2>&1 | tee native-c-stream-terminal-tests.log
       - name: Preserve host test results before changing platforms
         if: always()
         run: |
@@ -154,6 +164,7 @@ jobs:
             native-gemma-tool-abi-tests.log
             native-tests.log
             native-conversation-cache-tests.log
+            native-c-stream-terminal-tests.log
             native-framework.log
             native-package.log
             native-artifact/

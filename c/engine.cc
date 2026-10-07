@@ -79,11 +79,23 @@ absl::AnyInvocable<void(absl::StatusOr<litert::lm::Responses>)> CreateCallback(
       chunk.is_final = true;
       chunk.error_msg = "Max number of tokens reached.";
       callback(callback_data, &chunk);
-    } else if (responses->GetTaskState() == litert::lm::TaskState::kCancelled) {
+    } else if (responses->GetTaskState() == litert::lm::TaskState::kCancelled ||
+               responses->GetTaskState() ==
+                   litert::lm::TaskState::kDependentTaskCancelled) {
       LiteRtLmStreamChunk chunk;
       chunk.text = nullptr;
       chunk.is_final = true;
       chunk.error_msg = "CANCELLED.";
+      callback(callback_data, &chunk);
+    } else if (responses->GetTaskState() == litert::lm::TaskState::kFailed ||
+               responses->GetTaskState() ==
+                   litert::lm::TaskState::kDependentTaskFailed) {
+      LiteRtLmStreamChunk chunk;
+      chunk.text = nullptr;
+      chunk.is_final = true;
+      // A dependency failure carries its native state, not the predecessor's
+      // original Status. Report failure without inventing that missing cause.
+      chunk.error_msg = "Task failed.";
       callback(callback_data, &chunk);
     } else {
       for (const auto& text : responses->GetTexts()) {
