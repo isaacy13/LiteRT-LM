@@ -251,6 +251,8 @@ class ThreadedExecutionManager : public ExecutionManager {
       const override;
 
  private:
+  friend class SchedulingLifetimeTestPeer;
+
   ThreadedExecutionManager(
       Tokenizer* absl_nonnull tokenizer,
       std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
@@ -320,8 +322,12 @@ class ThreadedExecutionManager : public ExecutionManager {
   // - The set of following tasks that are waiting for dependent tasks.
   // Note: AllFollowingWaitingTasks expects the callers to acquire the task
   // lookup mutex before calling it.
+  // completion_owned_tasks, when present, contains only callbacks already
+  // transferred into this FinishTask caller's FailureDrain. Other malformed
+  // dependency edges still fail validation.
   absl::StatusOr<absl::flat_hash_set<TaskId>> FollowingWaitingTasks(
-      TaskId task_id)
+      TaskId task_id,
+      const absl::flat_hash_set<TaskId>* completion_owned_tasks = nullptr)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(session_and_task_lookup_mutex_);
 
   // Updates the task state with the given task ID and task state.

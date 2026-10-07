@@ -13,6 +13,10 @@ on:
         description: GTest filter for the callback-only host suite
         default: '*'
         type: string
+      host_only:
+        description: Run every native host gate and skip framework build/package
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -61,6 +65,21 @@ jobs:
         run: python3 tools/verify_apple_prebuilt_runtime.py
       - name: Package closure rejection controls
         run: python3 tools/package_apple_runtime_test.py
+      - name: Retain exact native host source identity
+        env:
+          NATIVE_TOOLCHAIN_FINGERPRINT: ${{ steps.native-toolchain.outputs.fingerprint }}
+        run: python3 tools/record_native_host_receipt.py
+      - name: Native scheduling and worker lifetime controls
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
+            //runtime/framework/resource_management:scheduling_lifetime_test \
+            //runtime/framework:threadpool_test \
+            2>&1 | tee native-scheduling-tests.log
       - name: Native Gemma tool provider ABI
         run: |
           set -o pipefail
@@ -110,6 +129,7 @@ jobs:
             cp -RL bazel-testlogs native-test-results
           fi
       - name: Build device and simulator framework
+        if: ${{ !inputs.host_only }}
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
@@ -118,6 +138,7 @@ jobs:
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             //swift:CLiteRTLM 2>&1 | tee native-framework.log
       - name: Package and verify the Apple runtime dependency graph
+        if: ${{ !inputs.host_only }}
         run: |
           set -o pipefail
           python3 tools/package_apple_runtime.py bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact \
@@ -126,8 +147,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: native-byte-contract-${{ github.sha }}
+          name: ${{ inputs.host_only && 'native-host-contract' || 'native-byte-contract' }}-${{ github.sha }}
           path: |
+            native-host-receipt.json
+            native-scheduling-tests.log
             native-gemma-tool-abi-tests.log
             native-tests.log
             native-conversation-cache-tests.log
