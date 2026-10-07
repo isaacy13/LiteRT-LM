@@ -94,8 +94,20 @@ class CountedExecutor : public FakeLlmExecutor {
     ++effects_->decode_calls;
     return FakeLlmExecutor::Decode(params);
   }
+  absl::StatusOr<std::unique_ptr<LlmContext>> CloneContext() const override {
+    ABSL_ASSIGN_OR_RETURN(int step, GetCurrentStep());
+    auto state = std::make_unique<RuntimeState>();
+    state->current_step = step;
+    return std::make_unique<LlmContext>(
+        nullptr, std::make_unique<RuntimeConfig>(runtime_config_), std::move(state));
+  }
+  absl::Status RestoreContext(std::unique_ptr<LlmContext> context) override {
+    runtime_config_ = context->runtime_config();
+    return SetCurrentStep(context->runtime_state().current_step);
+  }
  private:
   std::shared_ptr<Effects> effects_;
+  RuntimeConfig runtime_config_;
 };
 
 struct CProbe {
