@@ -45,6 +45,10 @@ namespace litert::lm {
 // SessionAdvanced is an implementation of SessionInterface. The
 // underlying prefill/decode use the LLM Execution Manager's advanced resource
 // management to support efficient multi-sessions and session cloning features.
+// Stateful methods that take the session mutex refuse same-thread reentry with
+// FailedPrecondition while a synchronous callback holds that mutex. Calls from
+// another thread retain serialization, and calls after the outer method returns
+// remain supported. Callbacks must not wait for or delete their own active task.
 class SessionAdvanced : public SessionInterface {
  public:
   class AdvancedTaskController : public SessionInterface::TaskController {

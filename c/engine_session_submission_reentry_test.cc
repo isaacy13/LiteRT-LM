@@ -367,10 +367,14 @@ bool NormalCallbackControl() {
   if (!prefill.ok() || !(*prefill)->WaitUntilDone(kWatchdog).ok() || !harness.Drain()) return false;
   auto probe = harness.Probe();
   auto next_terminals = std::make_shared<std::atomic<int>>(0);
-  probe->action = [&harness, session, next_terminals] {
+  auto next_success = std::make_shared<std::atomic<bool>>(false);
+  probe->action = [&harness, session, next_terminals, next_success] {
     if (litert_lm_session_save_checkpoint(session, "normal-terminal") != 0) return false;
-    auto next = harness.Prefill(session, [next_terminals](absl::StatusOr<Responses> response) {
-      if (!response.ok() || IsTaskEndState(response->GetTaskState())) ++*next_terminals;
+    auto next = harness.Prefill(session, [next_terminals, next_success](absl::StatusOr<Responses> response) {
+      if (!response.ok() || IsTaskEndState(response->GetTaskState())) {
+        ++*next_terminals;
+        *next_success = response.ok() && response->GetTaskState() == TaskState::kDone;
+      }
     });
     return next.ok();
   };
@@ -378,7 +382,8 @@ bool NormalCallbackControl() {
   if (!probe->finished.WaitForNotificationWithTimeout(kWatchdog) || !harness.Drain()) return false;
   return Check(probe->action_ok.load() && probe->finals.load() == 1 &&
       !probe->text.has_value() && !probe->error.has_value() &&
-      next_terminals->load() == 1 && harness.effects->prefill_calls.load() == 2 &&
+      next_terminals->load() == 1 && next_success->load() &&
+      harness.effects->prefill_calls.load() == 2 &&
       harness.effects->decode_calls.load() == 1, "Normal callback continuation refused or altered");
 }
 

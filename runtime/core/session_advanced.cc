@@ -53,6 +53,33 @@ namespace {
 
 using TaskController = SessionInterface::TaskController;
 
+// A callback may run synchronously while its submitting session holds mutex_.
+// Track only this thread's active lock scopes, including nested other sessions.
+class SessionLockScope {
+ public:
+  explicit SessionLockScope(const SessionAdvanced* session)
+      : session_(session), previous_(current_) {
+    current_ = this;
+  }
+  ~SessionLockScope() { current_ = previous_; }
+  SessionLockScope(const SessionLockScope&) = delete;
+  SessionLockScope& operator=(const SessionLockScope&) = delete;
+
+  static bool Contains(const SessionAdvanced* session) {
+    for (auto* scope = current_; scope != nullptr; scope = scope->previous_) {
+      if (scope->session_ == session) return true;
+    }
+    return false;
+  }
+
+ private:
+  const SessionAdvanced* session_;
+  const SessionLockScope* previous_;
+  static thread_local const SessionLockScope* current_;
+};
+
+thread_local const SessionLockScope* SessionLockScope::current_ = nullptr;
+
 }  // namespace
 
 // static
@@ -96,7 +123,12 @@ SessionAdvanced::RunPrefillAsync(
   if (contents.empty()) {
     return absl::InvalidArgumentError("Input is empty.");
   }
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
 
   auto execution_manager_lock = execution_manager_.lock();
@@ -146,7 +178,12 @@ absl::StatusOr<std::unique_ptr<TaskController>>
 SessionAdvanced::PrefillPreprocessedContents(
     std::vector<InputData> preprocessed_contents,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
@@ -253,7 +290,12 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
 absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
     const DecodeConfig& decode_config) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   if (session_state_ != SessionState::kPrefilled) {
     return absl::InternalError("Session is not prefilled yet.");
   }
@@ -343,7 +385,12 @@ SessionAdvanced::RunTextScoringAsync(
     const std::vector<absl::string_view>& target_text,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
     bool store_token_lengths) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   if (target_text.size() != 1) {
     return absl::InvalidArgumentError("Target text size should be 1.");
   }
@@ -406,7 +453,12 @@ absl::Status SessionAdvanced::GenerateContentStream(
 }
 
 absl::StatusOr<BenchmarkInfo> SessionAdvanced::GetBenchmarkInfo() {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   if (session_info_->benchmark_info.has_value()) {
     return session_info_->benchmark_info.value();
   }
@@ -424,10 +476,15 @@ absl::StatusOr<BenchmarkInfo*> SessionAdvanced::GetMutableBenchmarkInfo() {
 }
 
 absl::StatusOr<std::unique_ptr<SessionInterface>> SessionAdvanced::Clone() {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::Status status = absl::OkStatus();
   std::unique_ptr<SessionInterface> session;
   {
     absl::MutexLock lock(mutex_);
+    SessionLockScope operation(this);
     ABSL_ASSIGN_OR_RETURN(
         session,
         CloneAsyncLocked([&status](absl::StatusOr<Responses> responses) {
@@ -441,7 +498,12 @@ absl::StatusOr<std::unique_ptr<SessionInterface>> SessionAdvanced::Clone() {
 
 absl::StatusOr<std::unique_ptr<SessionInterface>> SessionAdvanced::CloneAsync(
     absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   return CloneAsyncLocked(std::move(callback));
 }
 
@@ -491,7 +553,12 @@ SessionAdvanced::~SessionAdvanced() {
 };
 
 absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
@@ -503,7 +570,12 @@ absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
 }
 
 absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
 
   // Look up the checkpoint step.
   auto it = checkpoint_map_.find(label);
@@ -532,7 +604,12 @@ absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
 }
 
 absl::Status SessionAdvanced::RewindToStep(int step) {
+  if (SessionLockScope::Contains(this)) {
+    return absl::FailedPreconditionError(
+        "Same-thread reentry into a locked session operation is not supported.");
+  }
   absl::MutexLock lock(mutex_);
+  SessionLockScope operation(this);
   auto execution_manager_lock = execution_manager_.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
