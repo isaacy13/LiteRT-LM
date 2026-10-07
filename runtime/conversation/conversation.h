@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_CONVERSATION_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_CONVERSATION_H_
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -613,6 +614,21 @@ class Conversation {
 
   // Returns the configuration used for creating the Conversation.
   const ConversationConfig& GetConfig() const { return config_; }
+
+  // Counts canonical processed first-input text on a private fresh probe.
+  // No existing conversation/session is accepted or mutated. Borrow Engine
+  // exclusively and keep it alive; serialize shared tokenizer/engine operations.
+  // Require deferred preface, no pending append/forced benchmark, text-only
+  // messages, and explicit integer extra_context.now. The result binds these
+  // exact frozen values, not a later rebuild or an existing/live KV cache.
+  // Reuse the same values and Engine for an independently created first Send.
+  // The private shell creates no Session/context/KV/sampler/worker state. Its
+  // data processor/parser/token buffers may allocate; no user-media I/O occurs.
+  // Custom Engines that alter session resolution differently are outside this
+  // contract; the default engine and census share the same resolution helper.
+  static absl::StatusOr<std::size_t> CountFirstInputTextTokens(
+      Engine& engine, const ConversationConfig& config, const Message& message,
+      const OptionalArgs& optional_args);
 
   // Returns the number of tokens in the conversation KV Cache (prefill +
   // decode).

@@ -14,7 +14,9 @@
 
 #include "runtime/conversation/conversation.h"
 
+#include <exception>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -51,6 +53,7 @@
 #include "runtime/conversation/model_data_processor/model_data_processor_factory.h"
 #include "runtime/conversation/prompt_utils.h"
 #include "runtime/conversation/thinking_config.h"
+#include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -71,6 +74,152 @@ constexpr absl::string_view kChannelContentCheckpoint =
     "channel_content_checkpoint";
 constexpr absl::string_view kStartContentCheckpoint =
     "start_content_checkpoint";
+
+nlohmann::ordered_json MessagesForConversion(
+    const Preface& preface, const Message& message, bool was_history_empty,
+    bool prefill_preface_on_init) {
+  nlohmann::ordered_json messages_for_conversion;
+  if (was_history_empty && !prefill_preface_on_init) {
+    if (std::holds_alternative<JsonPreface>(preface)) {
+      const auto& json_preface = std::get<JsonPreface>(preface);
+      if (json_preface.messages.is_array()) {
+        messages_for_conversion = json_preface.messages;
+      } else {
+        messages_for_conversion =
+            nlohmann::ordered_json::array({json_preface.messages});
+      }
+    }
+  }
+  if (messages_for_conversion.is_array()) {
+    if (message.is_array()) {
+      for (const auto& msg : message) {
+        messages_for_conversion.push_back(msg);
+      }
+    } else {
+      messages_for_conversion.push_back(message);
+    }
+  } else {
+    if (message.is_array()) {
+      messages_for_conversion = message;
+    } else {
+      messages_for_conversion = nlohmann::ordered_json::array({message});
+    }
+  }
+
+  return messages_for_conversion;
+}
+
+// This is a resolved native converter capability, not an artifact/model-name
+// or template/BOS recipe. These four canonical implementations already handle
+// absent content. The other registered converters index content unconditionally;
+// future variants default to refusal until their canonical contract is reviewed.
+bool SupportsBareToolCallMeasurement(const DataProcessorConfig& config) {
+  return std::holds_alternative<Gemma3DataProcessorConfig>(config) ||
+         std::holds_alternative<Gemma4DataProcessorConfig>(config) ||
+         std::holds_alternative<FunctionGemmaDataProcessorConfig>(config) ||
+         std::holds_alternative<Lfm2DataProcessorConfig>(config);
+}
+
+// Count-only admission. Never insert empty content or rewrite native history;
+// canonical rendering/conversion and ordinary Send remain unchanged.
+absl::Status ValidateTextMessageForMeasurement(
+    const Message& message, const DataProcessorConfig& processor_config) {
+  if (!message.is_object() || !message.contains("role") ||
+      !message["role"].is_string()) {
+    return absl::InvalidArgumentError("A message must have a string role.");
+  }
+  if (message.contains("tool_calls")) {
+    const auto& calls = message["tool_calls"];
+    if (!calls.is_array()) {
+      return absl::InvalidArgumentError("Tool calls must be an array.");
+    }
+    for (const auto& call : calls) {
+      if (!call.is_object() || !call.contains("function") ||
+          !call["function"].is_object() ||
+          !call["function"].contains("name") ||
+          !call["function"]["name"].is_string()) {
+        return absl::InvalidArgumentError(
+            "A tool call must have a function with a string name.");
+      }
+    }
+  }
+  if (!message.contains("content")) {
+    // Actual ConversationTurnCapture packets use assistant/model, nonempty
+    // calls and function objects. Missing content alone is not malformed.
+    if ((message["role"] != "assistant" && message["role"] != "model") ||
+        !message.contains("tool_calls") || message["tool_calls"].empty()) {
+      return absl::InvalidArgumentError(
+          "Absent content requires a nonempty assistant/model tool call.");
+    }
+    for (const auto& call : message["tool_calls"]) {
+      if (call["function"]["name"].get_ref<const std::string&>().empty() ||
+          (call.contains("type") && call["type"] != "function") ||
+          (call.contains("id") && !call["id"].is_string())) {
+        return absl::InvalidArgumentError("Invalid bare function-call shape.");
+      }
+    }
+    if (!SupportsBareToolCallMeasurement(processor_config)) {
+      return absl::UnimplementedError(
+          "The canonical converter requires explicit content for measurement.");
+    }
+    return absl::OkStatus();
+  }
+  const auto& content = message["content"];
+  if (content.is_string() || content.is_null()) return absl::OkStatus();
+  if (!content.is_array()) {
+    // Native tool-result JSON is serialized as text. Its arbitrary nested
+    // type/path/blob fields are data and must not be scanned as media items.
+    return message["role"] == "tool" &&
+                   SupportsBareToolCallMeasurement(processor_config)
+               ? absl::OkStatus()
+               : absl::UnimplementedError("Only text content can be measured.");
+  }
+  for (const auto& item : content) {
+    if (!item.is_object() || !item.contains("type") ||
+        !item["type"].is_string()) {
+      return absl::UnimplementedError(
+          "Measurement requires typed object content items.");
+    }
+    if (item["type"] == "tool_response" && message["role"] == "tool") {
+      continue;
+    }
+    if (item["type"] != "text") {
+      return absl::UnimplementedError("Only text content can be measured.");
+    }
+    if (!item.contains("text") || !item["text"].is_string()) {
+      return absl::InvalidArgumentError("Text content must have string text.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateTextMessagesForMeasurement(
+    const Message& messages, const DataProcessorConfig& processor_config) {
+  if (!messages.is_array()) {
+    return ValidateTextMessageForMeasurement(messages, processor_config);
+  }
+  for (const auto& message : messages) {
+    // Deliberately no recursive array/null admission: native converters expect
+    // each element to be one message object.
+    ABSL_RETURN_IF_ERROR(
+        ValidateTextMessageForMeasurement(message, processor_config));
+  }
+  return absl::OkStatus();
+}
+
+// This guard applies only to the new synchronous factory census. Existing
+// SessionLockScope guards and their callback behavior remain unchanged.
+class FirstInputCountScope {
+ public:
+  FirstInputCountScope() { active_ = true; }
+  FirstInputCountScope(const FirstInputCountScope&) = delete;
+  FirstInputCountScope& operator=(const FirstInputCountScope&) = delete;
+  ~FirstInputCountScope() { active_ = false; }
+  static bool Active() { return active_; }
+ private:
+  static thread_local bool active_;
+};
+thread_local bool FirstInputCountScope::active_ = false;
 
 bool IsEmptyInputError(const absl::Status& status) {
   return absl::IsInvalidArgument(status) &&
@@ -502,6 +651,98 @@ absl::StatusOr<std::unique_ptr<Conversation>> Conversation::Create(
   return conversation;
 }
 
+absl::StatusOr<std::size_t> Conversation::CountFirstInputTextTokens(
+    Engine& engine, const ConversationConfig& config, const Message& message,
+    const OptionalArgs& optional_args) {
+  if (FirstInputCountScope::Active()) {
+    return absl::FailedPreconditionError("Reentry into first-input count.");
+  }
+  FirstInputCountScope operation;
+  try {
+    // Values are frozen before a probe exists. Engine/tokenizer remain borrowed
+    // under the caller's exclusive inference gate for this whole operation.
+    const ConversationConfig frozen_config = config;
+    const Message frozen_message = message;
+    const OptionalArgs frozen_args = optional_args;
+    if (frozen_config.prefill_preface_on_init() ||
+        frozen_args.has_pending_message) {
+      return absl::FailedPreconditionError(
+          "First-input count requires deferred preface and a complete first send.");
+    }
+    const auto& benchmark = engine.GetEngineSettings().GetBenchmarkParams();
+    if (benchmark.has_value() && benchmark->num_prefill_tokens() > 0) {
+      return absl::FailedPreconditionError("Forced prefill count is unsupported.");
+    }
+    if (!frozen_args.extra_context.has_value() ||
+        !frozen_args.extra_context->is_object() ||
+        !frozen_args.extra_context->contains("now") ||
+        !(*frozen_args.extra_context)["now"].is_number_integer()) {
+      return absl::InvalidArgumentError("Count requires explicit integer now.");
+    }
+    if (!std::holds_alternative<JsonPreface>(frozen_config.GetPreface())) {
+      return absl::UnimplementedError("Only a text JsonPreface can be counted.");
+    }
+    const auto& preface = std::get<JsonPreface>(frozen_config.GetPreface());
+    // The canonical preface renderer only consumes arrays. Refuse ambiguous
+    // non-array messages rather than certify text that Send may ignore.
+    if (!preface.messages.is_null() && !preface.messages.is_array()) {
+      return absl::InvalidArgumentError("Preface messages must be an array.");
+    }
+    if (preface.messages.is_array()) {
+      ABSL_RETURN_IF_ERROR(ValidateTextMessagesForMeasurement(
+          preface.messages, frozen_config.GetProcessorConfig()));
+    }
+    ABSL_RETURN_IF_ERROR(ValidateTextMessagesForMeasurement(
+        frozen_message, frozen_config.GetProcessorConfig()));
+    // This operation creates no native Session. No Send, Cancel, Clone, Rewind,
+    // checkpoint, task submission or callback can acquire the private shell.
+    ABSL_ASSIGN_OR_RETURN(auto resolved_config, ResolveSessionConfigForCreation(
+        frozen_config.GetSessionConfig(), engine.GetEngineSettings()));
+    if (resolved_config.GetScopedLoraFile() != nullptr ||
+        resolved_config.GetAudioScopedLoraFile() != nullptr) {
+      return absl::UnimplementedError("Scoped LoRA is outside the text census contract.");
+    }
+    ABSL_ASSIGN_OR_RETURN(auto processor, CreateModelDataProcessor(
+        frozen_config.GetProcessorConfig(), frozen_config.GetPreface(),
+        &engine.GetTokenizer(), resolved_config.GetStopTokenIds(),
+        frozen_config.constrained_decoding_enabled(),
+        frozen_config.GetPromptTemplate().GetCapabilities()));
+    // Rendering has no session dependency. A null-session private shell avoids
+    // RegisterNewSession/CreateContextHandler/KV/sampler/modality executor setup.
+    auto probe = absl::WrapUnique(new Conversation(
+        engine, nullptr, std::move(processor), frozen_config.GetPreface(),
+        frozen_config.GetPromptTemplate(), frozen_config));
+    ABSL_ASSIGN_OR_RETURN(auto rendered,
+                          probe->GetSingleTurnText(frozen_message, frozen_args));
+    auto messages_for_conversion = MessagesForConversion(
+        probe->preface_, frozen_message, true, false);
+    ABSL_ASSIGN_OR_RETURN(auto input_data,
+                          probe->model_data_processor_->ToInputDataVector(
+                              rendered, messages_for_conversion,
+                              frozen_args.args.value_or(std::monostate())));
+    if (input_data.empty()) {
+      return absl::InvalidArgumentError("Input is empty.");
+    }
+    for (const auto& input : input_data) {
+      if (!std::holds_alternative<InputText>(input)) {
+        return absl::UnimplementedError("Conversion produced nontext input.");
+      }
+    }
+    auto& tokenizer = const_cast<support::Tokenizer&>(engine.GetTokenizer());
+    ABSL_ASSIGN_OR_RETURN(auto processed,
+                          PreparePrefillContents(
+                              input_data, resolved_config,
+                              tokenizer, std::nullopt, true, false));
+    return CalculateProcessedTextTokens(processed);
+  } catch (const nlohmann::json::exception&) {
+    return absl::InvalidArgumentError("Invalid native input JSON shape.");
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError("Count allocation failed.");
+  } catch (const std::exception&) {
+    return absl::InternalError("Native first-input count failed.");
+  }
+}
+
 void Conversation::AddTaskController(
     const std::optional<std::string>& task_group_id,
     std::unique_ptr<Engine::Session::TaskController> task_controller) {
@@ -618,33 +859,8 @@ absl::Status Conversation::SendMessageAsync(
     checkpoint_message_index_ = history_.size() - 1;
   }
 
-  nlohmann::ordered_json messages_for_conversion;
-  if (was_history_empty && !config_.prefill_preface_on_init()) {
-    if (std::holds_alternative<JsonPreface>(preface_)) {
-      const auto& json_preface = std::get<JsonPreface>(preface_);
-      if (json_preface.messages.is_array()) {
-        messages_for_conversion = json_preface.messages;
-      } else {
-        messages_for_conversion =
-            nlohmann::ordered_json::array({json_preface.messages});
-      }
-    }
-  }
-  if (messages_for_conversion.is_array()) {
-    if (message.is_array()) {
-      for (const auto& msg : message) {
-        messages_for_conversion.push_back(msg);
-      }
-    } else {
-      messages_for_conversion.push_back(message);
-    }
-  } else {
-    if (message.is_array()) {
-      messages_for_conversion = message;
-    } else {
-      messages_for_conversion = nlohmann::ordered_json::array({message});
-    }
-  }
+  nlohmann::ordered_json messages_for_conversion = MessagesForConversion(
+      preface_, message, was_history_empty, config_.prefill_preface_on_init());
 
   ABSL_ASSIGN_OR_RETURN(auto session_inputs,
                         model_data_processor_->ToInputDataVector(

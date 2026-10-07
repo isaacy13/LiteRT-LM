@@ -136,33 +136,12 @@ SessionAdvanced::RunPrefillAsync(
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
 
-  std::vector<InputData> preprocessed_contents;
-  if (session_info_->benchmark_info.has_value() &&
-      session_info_->benchmark_info->GetBenchmarkParams().num_prefill_tokens() >
-          0) {
-    ABSL_ASSIGN_OR_RETURN(
-        preprocessed_contents,
-        PreprocessContents(contents, session_info_->session_config, *tokenizer_,
-                           session_info_->benchmark_info));
-  } else {
-    bool is_first_turn = session_state_ == SessionState::kFresh;
-    ContentType content_type;
-    if (session_info_->session_config.GetApplyPromptTemplateInSession()) {
-      content_type = (is_first_turn || session_state_ == SessionState::kDecoded)
-                         ? ContentType::kFirst
-                         : ContentType::kMiddle;
-    } else {
-      content_type = ContentType::kNA;
-    }
-    ABSL_ASSIGN_OR_RETURN(std::vector<InputData> templated_contents,
-                          ApplyPromptTemplates(contents, content_type,
-                                               session_info_->session_config,
-                                               *tokenizer_, is_first_turn));
-    ABSL_ASSIGN_OR_RETURN(
-        preprocessed_contents,
-        PreprocessContents(templated_contents, session_info_->session_config,
-                           *tokenizer_, session_info_->benchmark_info));
-  }
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<InputData> preprocessed_contents,
+      PreparePrefillContents(contents, session_info_->session_config, *tokenizer_,
+                             session_info_->benchmark_info,
+                             session_state_ == SessionState::kFresh,
+                             session_state_ == SessionState::kDecoded));
   ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
   ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
       session_id_, task_id, std::move(preprocessed_contents), last_task_ids_,

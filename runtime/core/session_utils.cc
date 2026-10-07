@@ -14,6 +14,7 @@
 
 #include "runtime/core/session_utils.h"
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -220,6 +221,71 @@ absl::StatusOr<std::vector<InputData>> PreprocessContents(
     }
   }
   return preprocessed_contents;
+}
+
+absl::StatusOr<SessionConfig> ResolveSessionConfigForCreation(
+    const SessionConfig& input, const EngineSettings& settings) {
+  SessionConfig config = input;
+  ABSL_RETURN_IF_ERROR(config.MaybeUpdateAndValidate(settings));
+  return config;
+}
+
+absl::StatusOr<std::vector<InputData>> PreparePrefillContents(
+    const std::vector<InputData>& contents, const SessionConfig& session_config,
+    support::Tokenizer& tokenizer,
+    const std::optional<BenchmarkInfo>& benchmark_info, bool is_first_turn,
+    bool is_decoded) {
+  std::vector<InputData> preprocessed_contents;
+  if (benchmark_info.has_value() &&
+      benchmark_info->GetBenchmarkParams().num_prefill_tokens() >
+          0) {
+    ABSL_ASSIGN_OR_RETURN(
+        preprocessed_contents,
+        PreprocessContents(contents, session_config, tokenizer,
+                           benchmark_info));
+  } else {
+    ContentType content_type;
+    if (session_config.GetApplyPromptTemplateInSession()) {
+      content_type = (is_first_turn || is_decoded)
+                         ? ContentType::kFirst
+                         : ContentType::kMiddle;
+    } else {
+      content_type = ContentType::kNA;
+    }
+    ABSL_ASSIGN_OR_RETURN(std::vector<InputData> templated_contents,
+                          ApplyPromptTemplates(contents, content_type,
+                                               session_config,
+                                               tokenizer, is_first_turn));
+    ABSL_ASSIGN_OR_RETURN(
+        preprocessed_contents,
+        PreprocessContents(templated_contents, session_config,
+                           tokenizer, benchmark_info));
+  }
+  return preprocessed_contents;
+}
+
+// Derived from upstream CalculateTextTokens' preprocessed tensor branch at
+// 8eca57a5cd557a9ebf5257d5a9df04bae29218a6. Raw/media estimation is deliberately
+// not admitted: the caller must supply canonical processed text chunks.
+absl::StatusOr<std::size_t> CalculateProcessedTextTokens(
+    const std::vector<InputData>& contents) {
+  std::size_t total = 0;
+  for (const auto& input : contents) {
+    const auto* text = std::get_if<InputText>(&input);
+    if (text == nullptr || !text->IsTensorBuffer()) {
+      return absl::UnimplementedError("Only processed text can be counted.");
+    }
+    ABSL_ASSIGN_OR_RETURN(const auto* tensor, text->GetPreprocessedTextTensor());
+    ABSL_ASSIGN_OR_RETURN(auto ids_vec,
+                          support::Tokenizer::TensorBufferToTokenIds(*tensor));
+    for (const auto& ids : ids_vec) {
+      if (ids.size() > std::numeric_limits<std::size_t>::max() - total) {
+        return absl::OutOfRangeError("Processed text count overflow.");
+      }
+      total += ids.size();
+    }
+  }
+  return total;
 }
 
 }  // namespace litert::lm

@@ -41,6 +41,13 @@ SOURCE_PATHS = [
     'c/engine_stream_fanout_lifetime_test.cc',
     'runtime/core/session_advanced.cc', 'runtime/core/session_advanced.h',
     'c/engine_session_submission_reentry_test.cc',
+    'c/conversation.cc', 'c/conversation.h',
+    'c/conversation_factory_count_test.cc',
+    'runtime/conversation/BUILD', 'runtime/conversation/CMakeLists.txt',
+    'runtime/conversation/conversation.cc', 'runtime/conversation/conversation.h',
+    'runtime/core/BUILD', 'runtime/core/CMakeLists.txt',
+    'runtime/core/engine_advanced_impl.cc',
+    'runtime/core/session_utils.cc', 'runtime/core/session_utils.h',
 ]
 
 def main():

@@ -525,3 +525,41 @@ cc_test(
     ],
 )
 
+
+# Additive source-only canonical factory count controls.
+cc_test(
+    name = "conversation_factory_count_test",
+    srcs = ["conversation_factory_count_test.cc"],
+    tags = ["requires-mac-inputs:hard"],
+    data = ["//runtime/components/testdata"],
+    deps = [
+        ":conversation_headers",
+        ":conversation_internal",
+        ":engine_internal",
+        ":engine_cpu",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "//runtime/components:prompt_template",
+        "//runtime/conversation",
+        "//runtime/conversation:io_types",
+        "//runtime/conversation/model_data_processor:config_registry",
+        "//runtime/core:session_advanced",
+        "//runtime/core:session_utils",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:fake_llm_executor",
+        "//runtime/executor:llm_executor_io_types",
+        "//runtime/executor:llm_executor_processed_tokens",
+        "//runtime/framework/resource_management:threaded_execution_manager",
+        "//runtime/proto:engine_cc_proto",
+        "//runtime/proto:llm_metadata_cc_proto",
+        "//runtime/util:convert_tensor_buffer",
+        "//support/tokenizer",
+        "//support/tokenizer:sentencepiece_tokenizer",
+    ],
+)
