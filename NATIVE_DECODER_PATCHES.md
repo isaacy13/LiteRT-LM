@@ -278,3 +278,26 @@ target linked by both derived manager targets and the resource-manager facade.
 Its prior explicit target list omitted the new implementation; the generated
 source glob only copied it. Apple Bazel compilation does not validate a complete
 CMake build, which remains a separate verification requirement.
+
+## Framework minimum OS metadata
+
+Independent inspection of full native run37599604023 at1548634 accepted all
+309 host control cases, but rejected compatibility with GuideAI's iOS26.0
+deployment target. Both Gemma provider binaries declare a26.4 minimum while
+their generated framework plists declare15.0. The earlier package checks did
+not compare the actual binary minimum with its plist. Tests on iOS27 do not
+establish support for iOS26.0 through26.3. No older-OS launch failure has been
+reproduced. The pinned a70 provider has the same minimum-OS discrepancy.
+
+Dependency metadata now reads each copied binary's actual LC_BUILD_VERSION
+platform and minimum. Missing, ambiguous, legacy or malformed values fail
+packaging. Final inspection rejects a plist minimum below its binary's minimum
+and records both values in the existing framework manifest rows. Linkage
+rewriting and final signing retain their existing order. Binary minimums,
+source libraries and app deployment settings are unchanged.
+
+Seven additive offline controls preserve all ten original packaging cases.
+Actual controls and corrected packaging require execution before acceptance.
+Truthful26.4 metadata does not make the provider compatible with26.0. Resolve
+supported deployment separately before app adoption. Native host, framework,
+model, physical-device, lifetime and energy checks remain distinct.

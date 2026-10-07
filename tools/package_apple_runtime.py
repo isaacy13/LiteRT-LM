@@ -76,10 +76,44 @@ def validate_dependencies(name, linked, allowed):
             raise RuntimeError("Native iOS runtime APIs are not all strong dependencies")
 
 
-def framework_metadata(name, platform):
+def minimum_os_components(value):
+    if not isinstance(value, str) or re.fullmatch(
+            r"[1-9][0-9]*(?:\.(?:0|[1-9][0-9]*)){0,2}", value) is None:
+        raise RuntimeError(f"Malformed minimum OS version: {value!r}")
+    parts = [int(component) for component in value.split(".")]
+    parts += [0] * (3 - len(parts))
+    if parts[0] > 65535 or any(component > 255 for component in parts[1:]):
+        raise RuntimeError(f"Minimum OS version exceeds Mach-O component bounds: {value}")
+    return tuple(parts)
+
+
+def minimum_os_from_build(build, platform):
+    if platform not in {"IOS", "IOSSIMULATOR"}:
+        raise RuntimeError(f"Unsupported Apple runtime platform: {platform}")
+    blocks = re.findall(r"^\s*Load command [0-9]+[ \t]*$", build, re.M)
+    commands = re.findall(r"^\s*cmd\s+(\S+)\s*$", build, re.M)
+    platforms = re.findall(r"^\s*platform\s+(\S+)\s*$", build, re.M)
+    minimums = re.findall(r"^\s*minos\s+(\S+)\s*$", build, re.M)
+    if len(blocks) != 1 or commands != ["LC_BUILD_VERSION"]:
+        raise RuntimeError("Ambiguous/missing Mach-O build version command")
+    if platforms != [platform] or len(re.findall(r"^\s*platform\b", build, re.M)) != 1:
+        raise RuntimeError("Wrong/ambiguous Mach-O platform")
+    if len(minimums) != 1 or len(re.findall(r"^\s*minos\b", build, re.M)) != 1:
+        raise RuntimeError("Ambiguous/missing Mach-O minimum OS")
+    minimum_os_components(minimums[0])
+    return minimums[0]
+
+
+def validate_minimum_os_metadata(actual, declared):
+    if minimum_os_components(declared) < minimum_os_components(actual):
+        raise RuntimeError(f"Framework minimum OS {declared} understates actual Mach-O minimum {actual}")
+
+
+def framework_metadata(name, platform, binary):
+    minimum = minimum_os_from_build(run("vtool", "-show-build", str(binary)), platform)
     return {"CFBundleExecutable": name, "CFBundleIdentifier": f"com.guideai.litert.{name}",
             "CFBundleName": name, "CFBundlePackageType": "FMWK", "CFBundleVersion": "1",
-            "CFBundleShortVersionString": "0.17.1", "MinimumOSVersion": "15.0",
+            "CFBundleShortVersionString": "0.17.1", "MinimumOSVersion": minimum,
             "CFBundleSupportedPlatforms": ["iPhoneSimulator" if platform == "IOSSIMULATOR" else "iPhoneOS"]}
 
 
@@ -122,8 +156,8 @@ def inspect(frameworks):
                 raise RuntimeError(f"Invalid framework metadata at {framework}")
             if run("lipo", "-archs", str(binary)) != "arm64":
                 raise RuntimeError(f"Wrong architecture at {binary}")
-            if re.findall(r"^\s*platform\s+(\S+)", run("vtool", "-show-build", str(binary)), re.M) != [platform]:
-                raise RuntimeError(f"Wrong Mach-O platform at {binary}")
+            minimum = minimum_os_from_build(run("vtool", "-show-build", str(binary)), platform)
+            validate_minimum_os_metadata(minimum, metadata.get("MinimumOSVersion"))
             linked = dependencies(binary)
             own_id = run("otool", "-D", str(binary)).splitlines()[1:]
             if own_id != [install_name(name)]:
@@ -148,7 +182,8 @@ def inspect(frameworks):
             if list(framework.rglob("*.dylib")) or list(framework.glob("Frameworks/*")):
                 raise RuntimeError(f"Unsupported nested runtime payload at {framework}")
             results.append({"name": name, "slice": identifier, "platform": platform,
-                            "sha256": digest(binary), "dependencies": linked})
+                            "sha256": digest(binary), "dependencies": linked,
+                            "minimumOS": minimum, "frameworkMinimumOSVersion": metadata["MinimumOSVersion"]})
     return results
 
 
@@ -197,7 +232,8 @@ def package(source_archive, destination):
                 (framework / "Headers").mkdir(parents=True)
                 (framework / "Modules").mkdir()
                 shutil.copy2(ROOT / "prebuilt" / directory / library, framework / name)
-                (framework / "Info.plist").write_bytes(plistlib.dumps(framework_metadata(name, platform)))
+                (framework / "Info.plist").write_bytes(plistlib.dumps(
+                    framework_metadata(name, platform, framework / name)))
                 (framework / "Headers" / "RuntimeDependency.h").write_text("// APIs are bound internally by CLiteRTLM.\n")
                 (framework / "Modules" / "module.modulemap").write_text(
                     f'framework module {name} {{\n  umbrella header "RuntimeDependency.h"\n  export *\n}}\n')
