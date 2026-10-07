@@ -13,6 +13,10 @@ on:
         description: GTest filter for the callback-only host suite
         default: '*'
         type: string
+      reentry_only:
+        description: Run the bounded session submission reentry controls
+        default: false
+        type: boolean
       host_only:
         description: Run every native host gate and skip framework build/package
         default: false
@@ -27,7 +31,7 @@ concurrency:
 
 jobs:
   native:
-    if: ${{ !inputs.callback_only }}
+    if: ${{ !inputs.callback_only && !inputs.reentry_only }}
     runs-on: macos-15
     timeout-minutes: 180
     env:
@@ -135,6 +139,7 @@ jobs:
             --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
             //c:engine_stream_terminal_test \
             //c:engine_stream_fanout_lifetime_test \
+            //c:engine_session_submission_reentry_test \
             2>&1 | tee native-c-stream-terminal-tests.log
       - name: Preserve host test results before changing platforms
         if: always()
@@ -185,7 +190,8 @@ jobs:
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
   callback:
-    if: ${{ inputs.callback_only }}
+    if: ${{ inputs.callback_only || inputs.reentry_only }}
     uses: ./.github/workflows/native-callback-contract.yml
     with:
       test_filter: ${{ inputs.callback_test_filter }}
+      test_target: ${{ inputs.reentry_only && '//c:engine_session_submission_reentry_test' || '//runtime/conversation:internal_callback_util_test' }}

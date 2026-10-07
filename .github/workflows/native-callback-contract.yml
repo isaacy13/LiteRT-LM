@@ -7,6 +7,10 @@ on:
         description: GTest filter for the existing callback suite
         default: '*'
         type: string
+      test_target:
+        description: Bounded native callback target
+        default: '//runtime/conversation:internal_callback_util_test'
+        type: string
 
 permissions:
   contents: read
@@ -18,6 +22,7 @@ jobs:
     env:
       GIT_LFS_SKIP_SMUDGE: '1'
       CALLBACK_FILTER: ${{ inputs.test_filter }}
+      CALLBACK_TARGET: ${{ inputs.test_target }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -45,16 +50,20 @@ jobs:
           key: callback-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ github.sha }}
           restore-keys: |
             native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-
-      - name: Run existing native callback fixtures
+      - name: Run bounded native callback fixtures
         run: |
           set -o pipefail
+          case "$CALLBACK_TARGET" in
+            //runtime/conversation:internal_callback_util_test|//c:engine_session_submission_reentry_test) ;;
+            *) echo 'Unsupported callback target' >&2; exit 1 ;;
+          esac
           "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
             --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
             --experimental_disk_cache_gc_idle_delay=1s --local_ram_resources=4096 \
             --define=litert_runtime_link_mode=dynamic --nocache_test_results \
             --test_output=all --test_timeout=60 --verbose_failures \
             --test_arg="--gtest_filter=$CALLBACK_FILTER" \
-            //runtime/conversation:internal_callback_util_test \
+            "$CALLBACK_TARGET" \
             2>&1 | tee native-callback-tests.log
       - name: Retain exact callback evidence
         if: always()
@@ -63,6 +72,8 @@ jobs:
           name: native-callback-${{ github.sha }}
           path: |
             native-callback-tests.log
+            bazel-testlogs/c/engine_session_submission_reentry_test/test.log
+            bazel-testlogs/c/engine_session_submission_reentry_test/test.xml
             bazel-testlogs/runtime/conversation/internal_callback_util_test/test.log
             bazel-testlogs/runtime/conversation/internal_callback_util_test/test.xml
           if-no-files-found: error

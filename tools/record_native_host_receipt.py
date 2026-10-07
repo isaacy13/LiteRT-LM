@@ -39,6 +39,8 @@ SOURCE_PATHS = [
     'runtime/framework/threadpool_test.cc',
     'c/engine.cc', 'c/BUILD', 'c/engine_stream_terminal_test.cc',
     'c/engine_stream_fanout_lifetime_test.cc',
+    'runtime/core/session_advanced.cc', 'runtime/core/session_advanced.h',
+    'c/engine_session_submission_reentry_test.cc',
 ]
 
 def main():
