@@ -250,13 +250,14 @@ TEST(ThinkingBudgetConstraintTest, TestComputeMask) {
 
   auto state = constraint.Start();
 
-  // Initially in start matching - ComputeMask allows all tokens
+  // Initial choice allows valid content or the first thinking token.
   ASSERT_OK_AND_ASSIGN(auto mask, constraint.ComputeMask(*state));
   ASSERT_NE(mask, nullptr);
   EXPECT_EQ(mask->GetType(), MaskType::kBitmap);
   auto* bitmap_mask = static_cast<BitmapLogitMask*>(mask.get());
   EXPECT_TRUE(bitmap_mask->IsAllowed(10));
-  EXPECT_TRUE(bitmap_mask->IsAllowed(50));
+  EXPECT_TRUE(bitmap_mask->IsAllowed(20));
+  EXPECT_FALSE(bitmap_mask->IsAllowed(50));
 
   // Match start tokens
   ASSERT_OK_AND_ASSIGN(state, constraint.ComputeNext(*state, 10));

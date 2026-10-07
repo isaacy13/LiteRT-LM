@@ -575,7 +575,10 @@ cc_library(
         ":bitmap",
         ":constraint",
         ":logit_mask",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:litert_status_util",
     ],
 )
@@ -763,5 +766,26 @@ cc_test(
         "//runtime/util:test_utils",
         "//support/tokenizer",
         "@litert//tflite/types:half",
+    ],
+)
+
+# Real LLGuidance + thinking transition regressions, independent of model files.
+cc_test(
+    name = "thinking_budget_llguidance_test",
+    srcs = ["thinking_budget_llguidance_test.cc"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":logit_mask",
+        ":thinking_budget_constraint",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )

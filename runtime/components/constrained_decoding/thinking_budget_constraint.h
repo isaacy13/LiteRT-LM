@@ -60,8 +60,8 @@ class ThinkingBudgetConstraint : public Constraint {
     // or -1 if we are not matching or have finished matching.
     int matching_start_index = 0;
 
-    // The state of the wrapped user constraint, active during the content
-    // phase.
+    // The state of the wrapped user constraint, active for the initial
+    // content-or-thinking choice and during the content phase.
     std::unique_ptr<Constraint::State> user_state = nullptr;
   };
 
