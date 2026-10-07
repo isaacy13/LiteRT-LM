@@ -621,6 +621,10 @@ class Conversation {
   // Require deferred preface, no pending append/forced benchmark, text-only
   // messages, and explicit integer extra_context.now. The result binds these
   // exact frozen values, not a later rebuild or an existing/live KV cache.
+  // OptionalArgs is borrowed const (may own a move-only constraint). Keep it
+  // alive and unchanged until this synchronous operation returns; no option is
+  // consumed or reconstructed, and no caller reference escapes. The C factory
+  // supplies locally owned converted options.
   // Reuse the same values and Engine for an independently created first Send.
   // The private shell creates no Session/context/KV/sampler/worker state. Its
   // data processor/parser/token buffers may allocate; no user-media I/O occurs.

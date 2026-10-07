@@ -431,6 +431,40 @@ TEST(CanonicalFactoryCount, PrefilledPrefaceAndPendingAppendAreRefused) {
   }
   EXPECT_EQ(h.EngineOwner().created_sessions, 0);
 }
+TEST(CanonicalFactoryCount, BorrowedMoveOnlyOptionsRemainUnconsumed) {
+  Harness h;
+  ASSERT_TRUE(h.Initialize(true));
+  auto config = ConversationConfig::Builder().SetSessionConfig(h.Config())
+      .SetOverwritePromptTemplate(PromptTemplate(kTemplate))
+      .SetPrefillPrefaceOnInit(false).Build(h.EngineOwner());
+  ASSERT_TRUE(config.ok());
+  OptionalArgs args;
+  args.extra_context = nlohmann::ordered_json::parse(kExtra);
+  args.max_output_tokens = 17;
+  LlGuidanceConstraintArg constraint;
+  constraint.constraint_type = LlgConstraintType::kJsonSchema;
+  constraint.constraint_string = R"({"type":"object","properties":{"x":{"type":"string"}}})";
+  args.decoding_constraint = std::move(constraint);
+  const auto original_context = args.extra_context;
+  const auto original_schema = std::get<LlGuidanceConstraintArg>(*args.decoding_constraint).constraint_string;
+  const int reads = h.effects->step_reads;
+  const int restores = h.effects->context_restores;
+  for (int i = 0; i < 3; ++i) {
+    auto count = Conversation::CountFirstInputTextTokens(h.EngineOwner(), *config,
+        Message{{"role", "user"}, {"content", nlohmann::ordered_json::array({
+          {{"type", "text"}, {"text", "Exact options"}}})}}, args);
+    ASSERT_TRUE(count.ok());
+    EXPECT_GT(*count, 0u);
+    ASSERT_TRUE(args.decoding_constraint.has_value());
+    ASSERT_TRUE(std::holds_alternative<LlGuidanceConstraintArg>(*args.decoding_constraint));
+    EXPECT_EQ(std::get<LlGuidanceConstraintArg>(*args.decoding_constraint).constraint_string, original_schema);
+    EXPECT_EQ(args.extra_context, original_context);
+    EXPECT_EQ(args.max_output_tokens, 17);
+  }
+  EXPECT_TRUE(HasNoEffects(h, reads, restores));
+  EXPECT_EQ(h.EngineOwner().created_sessions, 0);
+}
+
 TEST(CanonicalFactoryCount, TokenizerFailureAndReentryLeaveNoNativeState) {
   Harness h; ASSERT_TRUE(h.Initialize()); auto config = h.Configuration();
   size_t count = 99; h.tokenizer.fail_encoding = true;

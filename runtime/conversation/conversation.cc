@@ -659,11 +659,15 @@ absl::StatusOr<std::size_t> Conversation::CountFirstInputTextTokens(
   }
   FirstInputCountScope operation;
   try {
-    // Values are frozen before a probe exists. Engine/tokenizer remain borrowed
-    // under the caller's exclusive inference gate for this whole operation.
+    // Config/message are copied before a probe exists. OptionalArgs can own a
+    // move-only external decoding constraint: borrow every option immutably for
+    // this synchronous operation rather than copy, move or reconstruct it. The
+    // C factory owns its converted args until this call returns. Direct C++
+    // callers must keep args alive and unchanged under the same exclusive gate
+    // that protects Engine/tokenizer for the whole operation.
     const ConversationConfig frozen_config = config;
     const Message frozen_message = message;
-    const OptionalArgs frozen_args = optional_args;
+    const OptionalArgs& frozen_args = optional_args;
     if (frozen_config.prefill_preface_on_init() ||
         frozen_args.has_pending_message) {
       return absl::FailedPreconditionError(
