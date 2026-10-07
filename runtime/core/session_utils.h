@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CORE_SESSION_UTILS_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CORE_SESSION_UTILS_H_
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -62,6 +63,22 @@ absl::StatusOr<std::vector<InputData>> PreprocessContents(
     const std::vector<InputData>& contents, const SessionConfig& session_config,
     support::Tokenizer& tokenizer,
     const std::optional<BenchmarkInfo>& benchmark_info);
+
+// Exact settings-based session config resolution used by default Engine creation.
+absl::StatusOr<SessionConfig> ResolveSessionConfigForCreation(
+    const SessionConfig& input, const EngineSettings& settings);
+
+// Canonical preprocessing shared by RunPrefillAsync and a private fresh shell.
+// No executor/session mutation, task enqueue or callback is performed here.
+absl::StatusOr<std::vector<InputData>> PreparePrefillContents(
+    const std::vector<InputData>& contents, const SessionConfig& session_config,
+    support::Tokenizer& tokenizer,
+    const std::optional<BenchmarkInfo>& benchmark_info, bool is_first_turn,
+    bool is_decoded);
+
+// Exact chunk-wise count of already-preprocessed text tensors only.
+absl::StatusOr<std::size_t> CalculateProcessedTextTokens(
+    const std::vector<InputData>& contents);
 
 }  // namespace litert::lm
 

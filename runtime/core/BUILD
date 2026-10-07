@@ -47,6 +47,7 @@ package_group(
 
 ENGINE_IMPL_COMMON_DEPS = [
     ":session_advanced",
+    ":session_utils",
     ":cached_session",
     "@com_google_absl//absl/base:no_destructor",
     "@com_google_absl//absl/log",

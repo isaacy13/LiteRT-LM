@@ -367,6 +367,26 @@ LITERT_LM_C_API_EXPORT
 LiteRtLmConversation* litert_lm_conversation_create(
     LiteRtLmEngine* engine, LiteRtLmConversationConfig* config);
 
+// Counts exact processed first-input text using a private never-sent probe.
+// This additive API does not accept a live/reused Conversation or count its KV.
+// Borrow Engine/config/options exclusively under an inference gate and keep
+// them alive. Freeze and reuse identical configuration/message/extra/options
+// for the later first Send on the same Engine; extra_context must be an object
+// containing integer now. Media, malformed shapes, pending append, prefilled
+// preface and forced benchmark input are refused. No user-media I/O,
+// prefill/decode/checkpoint/task/callback or native Session creation occurs.
+// Independent data processor/parser/token buffers may allocate; destruction
+// occurs before return, including failures. Default Engine settings-based
+// session configuration is shared; divergent custom Engine overrides are not
+// certified. Later send identity must be verified by the Swift caller.
+// Returns zero on success or numeric absl::StatusCode on failure; out_count is
+// initialized to zero when non-null. This operation emits no input JSON logs.
+LITERT_LM_C_API_EXPORT
+int litert_lm_engine_count_first_input_text_tokens(
+    LiteRtLmEngine* engine, const LiteRtLmConversationConfig* config,
+    const char* message_json, const char* extra_context,
+    const LiteRtLmConversationOptionalArgs* optional_args, size_t* out_count);
+
 // Destroys a LiteRT LM Conversation.
 //
 // @param conversation The conversation to destroy.

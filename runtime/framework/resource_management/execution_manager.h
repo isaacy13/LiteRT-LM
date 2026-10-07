@@ -80,6 +80,11 @@ struct TaskInfo {
   SessionId session_id;
   absl::AnyInvocable<void()> task;
   TaskState task_state = TaskState::kUnknown;
+  // Accepted terminal callbacks keep an active kLastCallbackQueued return
+  // fence. Their known final state already governs new dependencies while the
+  // sole callback owner is returning; Done permits normal continuations.
+  // Cleared only at terminal publication after callback return.
+  std::optional<TaskState> completion_state_after_callback = std::nullopt;
   absl::flat_hash_set<TaskId> dependent_tasks = {};
   absl::flat_hash_set<TaskId> following_tasks = {};
   std::shared_ptr<std::atomic<bool>> cancelled = nullptr;
