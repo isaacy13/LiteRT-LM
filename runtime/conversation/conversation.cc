@@ -660,6 +660,12 @@ absl::StatusOr<std::size_t> Conversation::CountFirstInputTextTokens(
     const ConversationConfig frozen_config = config;
     const Message frozen_message = message;
     const OptionalArgs& frozen_args = optional_args;
+    if (frozen_args.args.has_value() &&
+        engine.GetEngineSettings().GetMaxVisionTokensPerImage().has_value()) {
+      ABSL_RETURN_IF_ERROR(ValidateVisualTokenBudget(
+          *frozen_args.args,
+          *engine.GetEngineSettings().GetMaxVisionTokensPerImage()));
+    }
     if (frozen_config.prefill_preface_on_init() ||
         frozen_args.has_pending_message) {
       return absl::FailedPreconditionError(

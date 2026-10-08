@@ -547,5 +547,119 @@ TEST(CanonicalFactoryCount, RealSentencePieceActualProcessedPrefill) {
   EXPECT_EQ(h.effects->prefilled_ids.size(), measured);
 }
 
+// Configure only a fresh fixture: no Conversation or Session can retain the
+// original Engine. Production validation still reads the actual EngineSettings.
+void ConfigureFreshVisualBudgetFixture(Harness& h, int maximum_budget) {
+  ASSERT_EQ(h.EngineOwner().created_sessions, 0);
+  auto settings = h.EngineOwner().GetEngineSettings();
+  settings.SetMaxVisionTokensPerImage(maximum_budget);
+  h.c_engine.engine = std::make_unique<TestEngine>(
+      std::move(settings), h.tokenizer, h.owner);
+}
+
+TEST(CanonicalFactoryCount, VisualTokenBudgetRefusalsMatchActualSend) {
+  for (int budget : {-1, 0, 201}) {
+    SCOPED_TRACE(budget);
+    Harness h;
+    ASSERT_TRUE(h.Initialize(true, true));
+    ConfigureFreshVisualBudgetFixture(h, 200);
+    auto config = h.Configuration("[]", kPacketTemplate);
+    auto options = std::unique_ptr<LiteRtLmConversationOptionalArgs,
+        decltype(&litert_lm_conversation_optional_args_delete)>(
+        litert_lm_conversation_optional_args_create(),
+        litert_lm_conversation_optional_args_delete);
+    ASSERT_NE(options, nullptr);
+    litert_lm_conversation_optional_args_set_visual_token_budget(
+        options.get(), budget);
+    const int reads = h.effects->step_reads;
+    const int restores = h.effects->context_restores;
+    h.tokenizer.encoded_texts.clear();
+    size_t count = 99;
+    EXPECT_EQ(litert_lm_engine_count_first_input_text_tokens(
+        &h.c_engine, config.get(), kInput, kExtra, options.get(), &count),
+        static_cast<int>(absl::StatusCode::kInvalidArgument));
+    EXPECT_EQ(count, 0);
+    EXPECT_EQ(h.EngineOwner().created_sessions, 0);
+    EXPECT_TRUE(HasNoEffects(h, reads, restores));
+    EXPECT_TRUE(h.tokenizer.encoded_texts.empty());
+    EXPECT_EQ(options->visual_token_budget, budget);
+
+    auto conversation = std::unique_ptr<LiteRtLmConversation,
+        decltype(&litert_lm_conversation_delete)>(
+        litert_lm_conversation_create(&h.c_engine, config.get()),
+        litert_lm_conversation_delete);
+    ASSERT_NE(conversation, nullptr);
+    ASSERT_TRUE(conversation->conversation->GetHistory().empty());
+    const int send_reads = h.effects->step_reads;
+    const int send_restores = h.effects->context_restores;
+    h.tokenizer.encoded_texts.clear();
+    OptionalArgs args;
+    args.extra_context = nlohmann::ordered_json::parse(kExtra);
+    args.args = Gemma4DataProcessorArguments{.visual_token_budget = budget};
+    auto result = conversation->conversation->SendMessage(
+        nlohmann::json::parse(kInput), std::move(args));
+    ASSERT_FALSE(result.ok());
+    EXPECT_TRUE(absl::IsInvalidArgument(result.status()));
+    if (budget <= 0) {
+      EXPECT_EQ(result.status().message(), "Visual token budget must be positive.");
+    } else {
+      EXPECT_EQ(result.status().message(),
+          "Visual token budget (201) cannot be larger than the engine's max vision "
+          "tokens per image (200).");
+    }
+    auto response = std::unique_ptr<LiteRtLmJsonResponse,
+        decltype(&litert_lm_json_response_delete)>(
+        litert_lm_conversation_send_message(
+            conversation.get(), kInput, kExtra, options.get()),
+        litert_lm_json_response_delete);
+    EXPECT_EQ(response, nullptr);
+    EXPECT_EQ(h.EngineOwner().created_sessions, 1);
+    EXPECT_TRUE(HasNoEffects(h, send_reads, send_restores));
+    EXPECT_TRUE(h.tokenizer.encoded_texts.empty());
+    EXPECT_TRUE(conversation->conversation->GetHistory().empty());
+  }
+}
+
+TEST(CanonicalFactoryCount, VisualTokenBudgetAtEngineLimitMatchesProcessedPrefill) {
+  Harness h;
+  ASSERT_TRUE(h.Initialize(true, true));
+  ConfigureFreshVisualBudgetFixture(h, 200);
+  auto config = h.Configuration("[]", kPacketTemplate);
+  auto options = std::unique_ptr<LiteRtLmConversationOptionalArgs,
+      decltype(&litert_lm_conversation_optional_args_delete)>(
+      litert_lm_conversation_optional_args_create(),
+      litert_lm_conversation_optional_args_delete);
+  ASSERT_NE(options, nullptr);
+  litert_lm_conversation_optional_args_set_visual_token_budget(options.get(), 200);
+  const int reads = h.effects->step_reads;
+  const int restores = h.effects->context_restores;
+  h.tokenizer.encoded_texts.clear();
+  size_t count = 99;
+  ASSERT_EQ(litert_lm_engine_count_first_input_text_tokens(
+      &h.c_engine, config.get(), kInput, kExtra, options.get(), &count), 0);
+  EXPECT_GT(count, 0u);
+  EXPECT_EQ(h.EngineOwner().created_sessions, 0);
+  EXPECT_TRUE(HasNoEffects(h, reads, restores));
+  EXPECT_EQ(options->visual_token_budget, 200);
+  const auto counted_chunk_bytes = h.tokenizer.encoded_texts;
+  auto conversation = std::unique_ptr<LiteRtLmConversation,
+      decltype(&litert_lm_conversation_delete)>(
+      litert_lm_conversation_create(&h.c_engine, config.get()),
+      litert_lm_conversation_delete);
+  ASSERT_NE(conversation, nullptr);
+  ASSERT_TRUE(conversation->conversation->GetHistory().empty());
+  h.tokenizer.encoded_texts.clear();
+  auto response = std::unique_ptr<LiteRtLmJsonResponse,
+      decltype(&litert_lm_json_response_delete)>(
+      litert_lm_conversation_send_message(
+          conversation.get(), kInput, kExtra, options.get()),
+      litert_lm_json_response_delete);
+  ASSERT_NE(response, nullptr);
+  EXPECT_EQ(h.EngineOwner().created_sessions, 1);
+  EXPECT_GT(h.effects->prefills, 0);
+  EXPECT_EQ(h.effects->prefilled_ids.size(), count);
+  EXPECT_EQ(h.tokenizer.encoded_texts, counted_chunk_bytes);
+}
+
 }  // namespace
 }  // namespace litert::lm
