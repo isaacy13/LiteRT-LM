@@ -1,11 +1,11 @@
 --- a/litert/c/BUILD
 +++ b/litert/c/BUILD
-@@ -1059,8 +1059,36 @@
-     }),
+@@ -1016,8 +1016,28 @@
+     deps = [":litert_tflite_runtime_c_api_so_shim"],
  )
  
-+# LiteRT-LM already supplies device and simulator runtimes at its pinned revision.
-+# A macos_dylib target changes Apple platform and cannot serve an iOS consumer.
++# LiteRT-LM supplies matching device and simulator runtimes for this release.
++# The macos_dylib producer cannot serve an iOS consumer.
 +config_setting(
 +    name = "litert_lm_ios_device_arm64",
 +    values = {"apple_platform_type": "ios", "cpu": "ios_arm64"},
@@ -24,17 +24,9 @@
 +    }),
 +)
 +
-+filegroup(
-+    name = "litert_lm_ios_runtime_conditional",
-+    srcs = select({
-+        ":resolve_symbols_in_exec": [],
-+        "//conditions:default": [":litert_lm_ios_runtime"],
-+    }),
-+)
-+
  SELECT_LITERT_RUNTIME_C_API_SHARED_LIB = select({
--    "//litert:ios": [":litert_runtime_c_api_dylib_conditional"],
-+    "//litert:ios": [":litert_lm_ios_runtime_conditional"],
-     "//litert:macos": [":litert_runtime_c_api_dylib_conditional"],
+-    "//litert:ios": [":litert_runtime_c_api_dylib"],
++    "//litert:ios": [":litert_lm_ios_runtime"],
+     "//litert:macos": [":litert_runtime_c_api_dylib"],
      "//litert:windows": [],
-     "//conditions:default": [":litert_runtime_c_api_so_conditional"],
+     # The Emscripten toolchain can't emit a shared library; wasm clients link
