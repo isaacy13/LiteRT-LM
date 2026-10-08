@@ -392,6 +392,30 @@ cc_test(
 )
 
 cc_test(
+    name = "llg_fc_tool_calls_test",
+    srcs = ["llg_fc_tool_calls_test.cc"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":llguidance_schema_utils",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@nlohmann_json//:json",
+        "//runtime/util:litert_status_util",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+    ],
+)
+
+cc_test(
     name = "llg_python_tool_calls_test",
     srcs = ["llg_python_tool_calls_test.cc"],
     deps = [

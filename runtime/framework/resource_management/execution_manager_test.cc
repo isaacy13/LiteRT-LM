@@ -41,8 +41,8 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
@@ -262,7 +262,8 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
                        ModelAssets::Create("test_model_path_2"));
   ASSERT_OK_AND_ASSIGN(auto audio_settings,
                        AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+                           model_assets, 128, Backend::GPU_ARTISAN,
+                           Backend::GPU_ARTISAN));
 
   CreateExecutionManager(
       std::move(fake_llm_executor),
