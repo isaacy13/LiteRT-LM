@@ -28,6 +28,28 @@ LIBRARIES = {
 }
 SLICES = {"ios-arm64": ("ios_arm64", "IOS"),
           "ios-arm64-simulator": ("ios_sim_arm64", "IOSSIMULATOR")}
+PUBLIC_C_HEADERS = ("api_export.h", "conversation.h", "embedding_engine.h", "engine.h",
+                    "error_reporter.h", "experimental.h", "model_info.h")
+PUBLIC_C_SENTINELS = {
+    "litert_lm_engine_count_first_input_text_tokens",
+    "litert_lm_conversation_send_message_stream",
+    "litert_lm_embedding_engine_create",
+    "litert_lm_embedding_engine_compute_embedding",
+}
+GEMMA_PROVIDER_FUNCTIONS = {
+    "LiteRtLmGemmaModelConstraintProvider_Create",
+    "LiteRtLmGemmaModelConstraintProvider_Destroy",
+    "LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools",
+    "LiteRtLmConstraint_Destroy",
+}
+MAX_PUBLIC_HEADER_BYTES = 1024 * 1024
+_C_TYPE = (r"(?:const\s+)?(?:void|bool|char|int|float|double|size_t|u?int(?:8|16|32|64)_t|"
+           r"LiteRtLm[A-Za-z0-9_]+)(?:\s*\*\s*(?:const\b\s*)?)*")
+_C_DECLARATION = re.compile(
+    rf"({_C_TYPE})\s+(litert_lm_[a-z0-9_]+)\s*\(([^()]*)\)\s*;\Z")
+_C_PARAMETER = re.compile(rf"{_C_TYPE}\s+[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
 SAMPLER_FUNCTIONS = {
     "LiteRtTopKMetalSampler_Create", "LiteRtTopKMetalSampler_Destroy",
     "LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer", "LiteRtTopKMetalSampler_UpdateConfig",
@@ -49,6 +71,96 @@ def run(*args):
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def public_c_declarations(text):
+    if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_PUBLIC_HEADER_BYTES:
+        raise RuntimeError("Public C header exceeds its source bound")
+    # Remove non-code without interpreting conditional compilation. All declared
+    # public branches must be represented in the packaged export set.
+    code = []
+    index = 0
+    while index < len(text):
+        if text.startswith("//", index):
+            end = text.find("\n", index + 2)
+            end = len(text) if end < 0 else end
+            code.append(" " * (end - index))
+        elif text.startswith("/*", index):
+            closing = text.find("*/", index + 2)
+            if closing < 0:
+                raise RuntimeError("Unterminated public C header comment")
+            end = closing + 2
+            code.append("".join("\n" if c == "\n" else " " for c in text[index:end]))
+        elif text[index] in {"\"", "'"}:
+            quote = text[index]
+            end = index + 1
+            while end < len(text) and text[end] != quote:
+                if text[end] == "\\":
+                    end += 1
+                end += 1
+            if end >= len(text):
+                raise RuntimeError("Unterminated public C header literal")
+            end += 1
+            code.append("".join("\n" if c == "\n" else " " for c in text[index:end]))
+        else:
+            code.append(text[index])
+            end = index + 1
+        index = end
+    lines = []
+    continued = False
+    for line in "".join(code).splitlines(keepends=True):
+        if continued or line.lstrip().startswith("#"):
+            continued = line.rstrip("\r\n").endswith("\\")
+            lines.append("\n" if line.endswith("\n") else "")
+        else:
+            lines.append(line)
+    if continued:
+        raise RuntimeError("Unterminated public C preprocessor directive")
+    source = "".join(lines)
+    markers = list(re.finditer(r"\bLITERT_LM_C_API_EXPORT\b", source))
+    names = set()
+    for index, marker in enumerate(markers):
+        end = source.find(";", marker.end())
+        if end < 0 or (index + 1 < len(markers) and markers[index + 1].start() < end):
+            raise RuntimeError("Unmatched public C export marker")
+        declaration = source[marker.end():end + 1].strip()
+        match = _C_DECLARATION.fullmatch(declaration)
+        if match is None:
+            raise RuntimeError("Unsupported public C export declaration")
+        parameters = match[3].strip()
+        if parameters not in {"", "void"} and any(
+                _C_PARAMETER.fullmatch(parameter.strip()) is None
+                for parameter in parameters.split(",")):
+            raise RuntimeError("Unsupported public C export parameters")
+        if match[2] in names:
+            raise RuntimeError("Duplicate public C export declaration: " + match[2])
+        names.add(match[2])
+    return names
+
+
+def public_c_exports(directory):
+    names = set()
+    for header in PUBLIC_C_HEADERS:
+        with (directory / header).open("rb") as stream:
+            value = stream.read(MAX_PUBLIC_HEADER_BYTES + 1)
+        if len(value) > MAX_PUBLIC_HEADER_BYTES:
+            raise RuntimeError("Public C header exceeds its source bound: " + header)
+        declared = public_c_declarations(value.decode("utf-8"))
+        duplicates = names & declared
+        if duplicates:
+            raise RuntimeError("Duplicate public C exports across headers: " + repr(sorted(duplicates)))
+        names.update(declared)
+    if not PUBLIC_C_SENTINELS <= names:
+        raise RuntimeError("Required public C API sentinels are missing")
+    return names
+
+
+def validate_public_c_exports(symbols, expected):
+    if not PUBLIC_C_SENTINELS <= expected:
+        raise RuntimeError("Required public C API sentinels are missing")
+    missing = expected - symbols
+    if missing:
+        raise RuntimeError("Missing public C API exports: " + repr(sorted(missing)))
 
 
 def install_name(name):
@@ -149,6 +261,7 @@ def zip_directory(directory, archive):
 def inspect(frameworks):
     results = []
     allowed = {install_name(name) for name in frameworks}
+    expected_c_exports = public_c_exports(ROOT / "c") if "CLiteRTLM" in frameworks else set()
     for identifier, (_, platform) in SLICES.items():
         for name, xcframework in frameworks.items():
             info = plistlib.loads((xcframework / "Info.plist").read_bytes())
@@ -176,18 +289,17 @@ def inspect(frameworks):
             validate_dependencies(name, linked, allowed)
             symbols = exported_symbols(binary)
             if name == "CLiteRTLM":
-                for header in ("engine.h", "conversation.h", "embedding_engine.h", "capabilities.h"):
+                for header in PUBLIC_C_HEADERS:
                     if digest(framework / "Headers" / header) != digest(ROOT / "c" / header):
                         raise RuntimeError(f"C header differs from source at {framework}/{header}")
-                if "litert_lm_conversation_send_message_stream" not in symbols:
-                    raise RuntimeError(f"Missing native conversation API at {binary}")
+                validate_public_c_exports(symbols, expected_c_exports)
             elif name == "LiteRtRuntime" and "kLiteRtRuntimeBuiltin" not in symbols:
                 raise RuntimeError(f"Missing native runtime ABI at {binary}")
             elif name == "LiteRtMetalAccelerator" and "LiteRtAcceleratorImpl" not in symbols:
                 raise RuntimeError(f"Missing pinned Metal accelerator definition at {binary}")
             elif name == "LiteRtTopKMetalSampler" and not SAMPLER_FUNCTIONS <= symbols:
                 raise RuntimeError(f"Missing pinned Metal sampler functions at {binary}")
-            elif name == "GemmaModelConstraintProvider" and "LiteRtLmGemmaModelConstraintProvider_Create" not in symbols:
+            elif name == "GemmaModelConstraintProvider" and not GEMMA_PROVIDER_FUNCTIONS <= symbols:
                 raise RuntimeError(f"Missing native tool constraint provider at {binary}")
             run("codesign", "--verify", "--strict", str(framework))
             if list(framework.rglob("*.dylib")) or list(framework.glob("Frameworks/*")):

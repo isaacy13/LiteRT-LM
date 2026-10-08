@@ -209,7 +209,10 @@ class AppleRuntimeMinimumOSTests(unittest.TestCase):
             with patch("package_apple_runtime.run", side_effect=native) as calls, \
                     patch("package_apple_runtime.dependencies", return_value=[install_name(name)]), \
                     patch("package_apple_runtime.exported_symbols", return_value={
-                        "LiteRtLmGemmaModelConstraintProvider_Create"}) as exports:
+                        "LiteRtLmGemmaModelConstraintProvider_Create",
+                        "LiteRtLmGemmaModelConstraintProvider_Destroy",
+                        "LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools",
+                        "LiteRtLmConstraint_Destroy"}) as exports:
                 if succeeds:
                     result = inspect({name: root})
                     self.assertEqual(len(result), 2)
@@ -224,6 +227,186 @@ class AppleRuntimeMinimumOSTests(unittest.TestCase):
                         inspect({name: root})
                     exports.assert_not_called()
                     self.assertFalse(any(call.args[0] == "codesign" for call in calls.call_args_list))
+
+
+class ApplePublicCExportTests(unittest.TestCase):
+    def testActualPublicHeaderGraphAndAll213Declarations(self):
+        import re
+        from package_apple_runtime import ROOT, PUBLIC_C_HEADERS, PUBLIC_C_SENTINELS, public_c_exports
+        build = (ROOT / 'swift' / 'BUILD').read_text()
+        public = re.search(r'C_LITERT_LM_PUBLIC_HDRS = \[(.*?)\]', build, re.S).group(1)
+        self.assertEqual(set(re.findall(r'"//c:([^\"]+)"', public)), set(PUBLIC_C_HEADERS))
+        declared = public_c_exports(ROOT / 'c')
+        self.assertEqual(len(declared), 213)
+        self.assertTrue(PUBLIC_C_SENTINELS <= declared)
+        self.assertIn('litert_lm_loaded_file_model_type', declared)
+
+    def testCommentsLiteralsAndContinuedPreprocessorDoNotInventExports(self):
+        from package_apple_runtime import public_c_declarations
+        text = ('/* LITERT_LM_C_API_EXPORT int litert_lm_fake(void); */\n'
+                '// LITERT_LM_C_API_EXPORT int litert_lm_fake2(void);\n'
+                '#define LITERT_LM_C_API_EXPORT \\\n __attribute__((visibility("default")))\n'
+                '#define OTHER LITERT_LM_C_API_EXPORT void litert_lm_fake3(void);\n'
+                'const char* label = "LITERT_LM_C_API_EXPORT void litert_lm_fake4(void);";\n'
+                'LITERT_LM_C_API_EXPORT const char* litert_lm_real(void);\n'
+                'LITERT_LM_C_API_EXPORT int litert_lm_other(const LiteRtLmInputData* const* inputs, size_t count);\n')
+        self.assertEqual(public_c_declarations(text), {'litert_lm_real', 'litert_lm_other'})
+
+    def testEveryMalformedOrUnmatchedMarkerRefuses(self):
+        from package_apple_runtime import public_c_declarations
+        declarations = [
+            '', 'int litert_lm_missing(void)', 'int not_public(void);',
+            'int litert_lm_variable;', 'int litert_lm_variable = 0;',
+            'int litert_lm_definition(void) { return 0; }',
+            'int litert_lm_first(void), litert_lm_second(void);',
+            'int litert_lm_callback(void (*callback)(int));',
+            'int litert_lm_array(int values[4]);',
+            'int litert_lm_default(int value = 2);',
+            'int litert_lm_varargs(int value, ...);',
+            'int litert_lm_attribute(void) OTHER_ATTRIBUTE;',
+            'LITERT_LM_C_API_EXPORT int litert_lm_second(void);',
+        ]
+        for declaration in declarations:
+            with self.subTest(declaration=declaration), self.assertRaises(RuntimeError):
+                public_c_declarations('LITERT_LM_C_API_EXPORT ' + declaration)
+        for suffix in ['/* unterminated', '"unterminated', '#define UNFINISHED \\']:
+            with self.subTest(suffix=suffix), self.assertRaises(RuntimeError):
+                public_c_declarations(suffix)
+
+    def testDuplicateNamesRefuseWithinAndAcrossHeaders(self):
+        from package_apple_runtime import PUBLIC_C_HEADERS, public_c_declarations, public_c_exports
+        declaration = 'LITERT_LM_C_API_EXPORT int litert_lm_same(void);\n'
+        with self.assertRaisesRegex(RuntimeError, 'Duplicate'):
+            public_c_declarations(declaration + declaration)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for header in PUBLIC_C_HEADERS:
+                (root / header).write_text('')
+            (root / 'engine.h').write_text(declaration)
+            (root / 'conversation.h').write_text(declaration)
+            with self.assertRaisesRegex(RuntimeError, 'Duplicate'):
+                public_c_exports(root)
+
+    def testHeaderAndSentinelFailuresCannotProducePartialExpectedSet(self):
+        from package_apple_runtime import PUBLIC_C_HEADERS, MAX_PUBLIC_HEADER_BYTES, public_c_exports
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for header in PUBLIC_C_HEADERS:
+                (root / header).write_text('')
+            with self.assertRaisesRegex(RuntimeError, 'sentinels'):
+                public_c_exports(root)
+            (root / 'engine.h').write_bytes(b' ' * (MAX_PUBLIC_HEADER_BYTES + 1))
+            with self.assertRaisesRegex(RuntimeError, 'bound'):
+                public_c_exports(root)
+            (root / 'engine.h').unlink()
+            with self.assertRaises(FileNotFoundError):
+                public_c_exports(root)
+
+    def testEveryActualDeclaredExportIsRequiredNotOnlySentinels(self):
+        from package_apple_runtime import ROOT, public_c_exports, validate_public_c_exports
+        declared = public_c_exports(ROOT / 'c')
+        validate_public_c_exports(declared | {'unrelated_private_symbol'}, declared)
+        for name in sorted(declared):
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'Missing public'):
+                validate_public_c_exports(declared - {name}, declared)
+        with self.assertRaisesRegex(RuntimeError, 'sentinels'):
+            validate_public_c_exports(set(), set())
+
+    def testAllFourGemmaCExportsMatchCurrentSource(self):
+        import re
+        from package_apple_runtime import ROOT, GEMMA_PROVIDER_FUNCTIONS
+        source = (ROOT / 'runtime' / 'components' / 'constrained_decoding' /
+                  'gemma_model_constraint_provider.h').read_text()
+        declarations = re.findall(r'^GEMMA_MODEL_CONSTRAINT_PROVIDER_EXPORT\s+[^;]+;', source, re.M)
+        names = {re.search(r'\b(LiteRtLm[A-Za-z0-9_]+)\s*\(', declaration).group(1)
+                 for declaration in declarations}
+        self.assertEqual(names, GEMMA_PROVIDER_FUNCTIONS)
+        self.assertEqual(len(names), 4)
+
+    def testBothCoreSlicesVerifyAllHeadersAndExportsBeforeSignature(self):
+        self.inspectFixture()
+        self.inspectFixture(missing=('CLiteRTLM', 'litert_lm_loaded_file_model_type'))
+        for header in ('api_export.h', 'model_info.h'):
+            with self.subTest(header=header):
+                self.inspectFixture(changed_header=header)
+
+    def testEachGemmaCExportMissingFromSecondSliceRefuses(self):
+        from package_apple_runtime import GEMMA_PROVIDER_FUNCTIONS
+        for name in sorted(GEMMA_PROVIDER_FUNCTIONS):
+            with self.subTest(name=name):
+                self.inspectFixture(missing=('GemmaModelConstraintProvider', name))
+
+    def inspectFixture(self, missing=None, changed_header=None):
+        # Structural Python control only: every native command is mocked.
+        import plistlib
+        import shutil
+        from package_apple_runtime import (ROOT, PUBLIC_C_HEADERS, public_c_exports,
+                                          GEMMA_PROVIDER_FUNCTIONS, SAMPLER_FUNCTIONS, SLICES)
+        core = public_c_exports(ROOT / 'c')
+        exports = {'CLiteRTLM': core, 'LiteRtRuntime': {'kLiteRtRuntimeBuiltin'},
+                   'GemmaModelConstraintProvider': GEMMA_PROVIDER_FUNCTIONS,
+                   'LiteRtMetalAccelerator': {'LiteRtAcceleratorImpl'},
+                   'LiteRtTopKMetalSampler': SAMPLER_FUNCTIONS}
+        with tempfile.TemporaryDirectory() as temporary:
+            frameworks = {}
+            for name in ['CLiteRTLM', *LIBRARIES.values()]:
+                root = Path(temporary) / (name + '.xcframework')
+                root.mkdir()
+                entries = []
+                for identifier, (_, platform) in SLICES.items():
+                    entry = {'LibraryIdentifier': identifier, 'LibraryPath': name + '.framework',
+                             'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}
+                    if platform == 'IOSSIMULATOR':
+                        entry['SupportedPlatformVariant'] = 'simulator'
+                    entries.append(entry)
+                    framework = root / identifier / (name + '.framework')
+                    framework.mkdir(parents=True)
+                    (framework / name).write_bytes(b'offline structural fixture, not native binary')
+                    (framework / 'Info.plist').write_bytes(plistlib.dumps({
+                        'CFBundleExecutable': name, 'CFBundlePackageType': 'FMWK', 'MinimumOSVersion': '26.4'}))
+                    if name == 'CLiteRTLM':
+                        (framework / 'Headers').mkdir()
+                        for header in PUBLIC_C_HEADERS:
+                            shutil.copyfile(ROOT / 'c' / header, framework / 'Headers' / header)
+                        if changed_header and platform == 'IOSSIMULATOR':
+                            (framework / 'Headers' / changed_header).write_text('changed source bytes\n')
+                (root / 'Info.plist').write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
+                frameworks[name] = root
+            signatures = []
+            def native(*args):
+                if args[:2] == ('lipo', '-archs'):
+                    return 'arm64'
+                if args[:2] == ('vtool', '-show-build'):
+                    platform = 'IOSSIMULATOR' if 'ios-arm64-simulator' in args[2] else 'IOS'
+                    return build_version_fixture(platform)
+                if args[:2] == ('otool', '-D'):
+                    return args[2] + ':\n' + install_name(Path(args[2]).name)
+                if args[:3] == ('codesign', '--verify', '--strict'):
+                    signatures.append(Path(args[3]))
+                    return ''
+                self.fail('Unexpected native call ' + repr(args))
+            def linked(binary):
+                return [install_name(binary.name), *([install_name(n) for n in LIBRARIES.values()]
+                        if binary.name == 'CLiteRTLM' else [])]
+            def symbols(binary):
+                result = set(exports[binary.name])
+                if missing and binary.name == missing[0] and 'ios-arm64-simulator' in binary.parts:
+                    result.remove(missing[1])
+                return result
+            with patch('package_apple_runtime.run', side_effect=native), \
+                    patch('package_apple_runtime.dependencies', side_effect=linked), \
+                    patch('package_apple_runtime.exported_symbols', side_effect=symbols):
+                if missing or changed_header:
+                    with self.assertRaisesRegex(RuntimeError, 'Missing public|tool constraint|header differs'):
+                        inspect(frameworks)
+                    blocked_name = missing[0] if missing else 'CLiteRTLM'
+                    self.assertFalse(any(p.name == blocked_name + '.framework'
+                                         and 'ios-arm64-simulator' in p.parts for p in signatures))
+                else:
+                    result = inspect(frameworks)
+                    self.assertEqual(len(result), 10)
+                    self.assertEqual(len(signatures), 10)
+                    self.assertEqual({row['name'] for row in result}, set(frameworks))
 
 
 if __name__ == "__main__":
