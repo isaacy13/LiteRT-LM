@@ -26,6 +26,7 @@ licenses(["notice"])
 
 cc_library(
     name = "execution_manager",
+    srcs = ["execution_manager.cc"],
     hdrs = ["execution_manager.h"],
     deps = [
         "@com_google_absl//absl/base:nullability",
@@ -35,6 +36,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
         "@litert//litert/cc:litert_tensor_buffer",
         "//runtime/components:sampler",
         "//runtime/components:stop_token_detector",
@@ -46,6 +48,7 @@ cc_library(
         "//runtime/engine:io_types",
         "//runtime/executor:llm_executor_io_types",
         "//runtime/framework/resource_management/context_handler",
+        "//runtime/util:convert_tensor_buffer",
     ],
 )
 
@@ -247,5 +250,65 @@ cc_library(
         "@litert//litert/cc:litert_environment_options",
         "@litert//litert/cc:litert_macros",
         "@litert//litert/cc:litert_tensor_buffer",
+    ],
+)
+
+# Additive real-pool scheduling/refusal and callback-return fence controls.
+cc_test(
+    name = "scheduling_lifetime_test",
+    srcs = ["scheduling_lifetime_test.cc"],
+    deps = [
+        ":execution_manager",
+        ":threaded_execution_manager",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:fake_llm_executor",
+        "//runtime/executor:llm_executor_io_types",
+        "//runtime/framework:threadpool",
+        "//runtime/proto:token_cc",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+    ],
+)
+
+# Additive failure/cancellation fanout return and reentry controls.
+cc_test(
+    name = "fanout_lifetime_test",
+    srcs = ["fanout_lifetime_test.cc"],
+    deps = [
+        ":execution_manager",
+        ":threaded_execution_manager",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/functional:any_invocable",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/executor:fake_llm_executor",
+        "//runtime/executor:llm_executor_io_types",
+        "//runtime/framework:threadpool",
+        "//runtime/proto:token_cc",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
     ],
 )

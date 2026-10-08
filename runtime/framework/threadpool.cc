@@ -76,6 +76,11 @@ ThreadPool::~ThreadPool() {
 }
 
 absl::Status ThreadPool::Schedule(absl::AnyInvocable<void() &&> callback) {
+  return TrySchedule(callback);
+}
+
+absl::Status ThreadPool::TrySchedule(
+    absl::AnyInvocable<void() &&>& callback) {
   absl::MutexLock lock(mutex_);
   if (stopped_) {
     ABSL_LOG(WARNING) << "ThreadPool '" << name_prefix_
@@ -90,7 +95,9 @@ absl::Status ThreadPool::Schedule(absl::AnyInvocable<void() &&> callback) {
   if (num_threads < max_num_threads_) {
     size_t num_tasks = num_active_tasks_ + tasks_.size();
     if (num_threads <= num_tasks) {
-      auto thread = WorkerThread::Create(this, name_prefix_);
+      auto thread = worker_factory_for_test_ != nullptr
+                        ? worker_factory_for_test_(this, name_prefix_)
+                        : WorkerThread::Create(this, name_prefix_);
       if (thread.ok()) {
         threads_.push_back(std::move(*thread));
         ABSL_VLOG(1) << "ThreadPool '" << name_prefix_

@@ -50,6 +50,7 @@ package_group(
 ENGINE_IMPL_COMMON_DEPS = [
     ":audio_session_advanced",
     ":session_advanced",
+    ":session_utils",
     ":cached_session",
     "@com_google_absl//absl/base:core_headers",
     "@com_google_absl//absl/base:no_destructor",

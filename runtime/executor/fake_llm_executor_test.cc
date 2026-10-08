@@ -91,6 +91,48 @@ TEST(FakeLlmExecutorTest, Prefill) {
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 3);
 }
 
+TEST(FakeLlmExecutorTest, ResetClearsProcessedPrefixAndAllowsFreshPrefill) {
+  FakeLlmExecutor executor(/*vocab_size=*/5, {{1, 2, 3}}, {{4}, {0}});
+  const std::vector<int> prefill_ids = {1, 2, 3};
+  const std::vector<int> decode_ids = {3};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto prefill_buffer,
+      CopyToTensorBuffer<int>(absl::MakeConstSpan(prefill_ids), {1, 3}));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto decode_buffer,
+      CopyToTensorBuffer<int>(absl::MakeConstSpan(decode_ids), {1, 1}));
+  ExecutorInputs prefill;
+  prefill.SetTextData(ExecutorTextData(std::move(prefill_buffer)));
+  ExecutorInputs decode;
+  decode.SetTextData(ExecutorTextData(std::move(decode_buffer)));
+
+  for (int cycle = 0; cycle < 2; ++cycle) {
+    ASSERT_OK(executor.Prefill(prefill));
+    ASSERT_OK_AND_ASSIGN(auto tokens, executor.GetProcessedTokens());
+    EXPECT_EQ(tokens->TokenCount(), 3);
+    EXPECT_EQ(executor.GetCurrentStep().value(), 3);
+    ASSERT_OK_AND_ASSIGN(auto logits, executor.DecodeLogits(decode));
+    LITERT_ASSERT_OK_AND_ASSIGN(auto values,
+                                ReferTensorBufferAsSpan<float>(logits));
+    ASSERT_EQ(values.size(), 5);
+    EXPECT_GE(values[4], 0.0f);
+    for (int id = 0; id < 4; ++id) {
+      EXPECT_LE(values[id], 0.0f);
+    }
+    EXPECT_EQ(tokens->TokenCount(), 4);
+    EXPECT_EQ(executor.GetCurrentStep().value(), 4);
+
+    ASSERT_OK(executor.Reset());
+    EXPECT_EQ(tokens->TokenCount(), 0);
+    EXPECT_EQ(executor.GetCurrentStep().value(), 0);
+    EXPECT_THAT(executor.DecodeLogits(decode),
+                StatusIs(absl::StatusCode::kFailedPrecondition,
+                         "Decode called without prior prefill or decode."));
+    ASSERT_OK(executor.Reset());
+    EXPECT_EQ(tokens->TokenCount(), 0);
+  }
+}
+
 TEST(FakeLlmExecutorTest, PrefillWithAudio) {
   const std::vector<std::vector<int>> prefill_tokens_set = {{1, 2, 3}};
   const std::vector<std::vector<int>> decode_tokens_set = {{3, 2}, {0, 0}};

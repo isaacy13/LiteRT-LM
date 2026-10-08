@@ -29,6 +29,7 @@ cc_library(
     name = "engine_interface",
     hdrs = ["engine.h"],
     deps = [
+        "//runtime/components/constrained_decoding:constraint_provider_cache",
         ":engine_settings",
         ":io_types",
         "@com_google_absl//absl/base:core_headers",

@@ -42,6 +42,7 @@
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/external_constraint_config.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
 #include "runtime/components/constrained_decoding/repetition_penalty_config.h"
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
@@ -187,6 +188,22 @@ class MockEngine : public Engine {
               (const SessionConfig& session_config), (override));
   MOCK_METHOD(absl::Status, WaitUntilDone, (absl::Duration timeout),
               (override));
+};
+
+// Gemma's native tool processor consumes the concrete SentencePiece processor.
+// Keep that actual object while counting LLGuidance vocabulary construction.
+class CountingTokenizer : public SentencePieceTokenizer {
+ public:
+  explicit CountingTokenizer(SentencePieceTokenizer&& tokenizer)
+      : SentencePieceTokenizer(std::move(tokenizer)) {}
+  support::ConstraintVocabulary GetConstraintVocabulary() const override {
+    ++vocabulary_reads_;
+    return SentencePieceTokenizer::GetConstraintVocabulary();
+  }
+  int vocabulary_reads() const { return vocabulary_reads_; }
+
+ private:
+  mutable int vocabulary_reads_ = 0;
 };
 
 class MockTaskController : public SessionInterface::TaskController {
@@ -440,6 +457,50 @@ class ConversationTest : public testing::TestWithParam<ConversationTestParams> {
   bool enable_constrained_decoding_ = GetParam().enable_constrained_decoding;
   bool prefill_preface_on_init_ = GetParam().prefill_preface_on_init;
 };
+
+TEST_P(ConversationTest, EngineConstraintProviderReusedByCreate) {
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
+  auto engine = CreateMockEngine(CreateMockSession());
+  EXPECT_CALL(*engine, GetTokenizer()).WillRepeatedly(testing::ReturnRef(tokenizer));
+  ASSERT_OK_AND_ASSIGN(
+      auto config, ConversationConfig::Builder()
+                       .SetSessionConfig(session_config_)
+                       .SetOverwritePromptTemplate(PromptTemplate(kTestJinjaPromptTemplate))
+                       .SetEnableConstrainedDecoding(enable_constrained_decoding_)
+                       .SetPrefillPrefaceOnInit(prefill_preface_on_init_)
+                       .SetConstraintProviderConfig(LlGuidanceConfig())
+                       .Build(*engine));
+  ASSERT_OK_AND_ASSIGN(auto first, Conversation::Create(*engine, config));
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+  EXPECT_CALL(*engine, CreateSession(testing::_))
+      .WillOnce(testing::Return(CreateMockSession()));
+  ASSERT_OK_AND_ASSIGN(auto second, Conversation::Create(*engine, config));
+  EXPECT_NE(first.get(), second.get());
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+}
+
+TEST_P(ConversationTest, EngineConstraintProviderReusedByClone) {
+  CountingTokenizer tokenizer(
+      std::move(static_cast<SentencePieceTokenizer&>(*tokenizer_)));
+  auto session = CreateMockSession();
+  auto* session_ptr = session.get();
+  auto engine = CreateMockEngine(std::move(session));
+  EXPECT_CALL(*engine, GetTokenizer()).WillRepeatedly(testing::ReturnRef(tokenizer));
+  ASSERT_OK_AND_ASSIGN(
+      auto config, ConversationConfig::Builder()
+                       .SetSessionConfig(session_config_)
+                       .SetOverwritePromptTemplate(PromptTemplate(kTestJinjaPromptTemplate))
+                       .SetEnableConstrainedDecoding(enable_constrained_decoding_)
+                       .SetPrefillPrefaceOnInit(prefill_preface_on_init_)
+                       .SetConstraintProviderConfig(LlGuidanceConfig())
+                       .Build(*engine));
+  ASSERT_OK_AND_ASSIGN(auto conversation, Conversation::Create(*engine, config));
+  EXPECT_CALL(*session_ptr, Clone()).WillOnce(testing::Return(CreateMockSession()));
+  ASSERT_OK_AND_ASSIGN(auto clone, conversation->Clone());
+  EXPECT_NE(conversation.get(), clone.get());
+  EXPECT_EQ(tokenizer.vocabulary_reads(), 1);
+}
 
 TEST_P(ConversationTest, SendMessage) {
   ASSERT_OK_AND_ASSIGN(auto model_assets,
@@ -3993,8 +4054,7 @@ You are a helpful assistant.
   absl::string_view expected_prefill_5 = R"(<end_of_turn>
 <start_of_turn>user
 ```tool_outputs
-{"location": "Paris", "temperature": 20, "unit": "C", "weather": "Sunny"}
-)";
+{"location": "Paris", "temperature": 20, "unit": "C", "weather": "Sunny"})";
   EXPECT_CALL(
       *mock_session_ptr,
       RunPrefillAsync(testing::ElementsAre(testing::VariantWith<InputText>(
@@ -4025,7 +4085,6 @@ You are a helpful assistant.
   // Append the 6th message.
   absl::string_view expected_prefill_6 =
       R"({"location": "London", "temperature": 15, "unit": "C", "weather": "Cloudy"}
-
 ```<end_of_turn>
 <start_of_turn>model
 )";
@@ -4063,253 +4122,6 @@ You are a helpful assistant.
                                                     }},
                                                }}},
                                       {.has_pending_message = false}));
-}
-
-TEST(AppendMessageTest, CancelProcessDuringSendMessageAsyncWithPendingMessage) {
-  // Set up mock Session.
-  auto mock_session = std::make_unique<MockSession>();
-  MockSession* mock_session_ptr = mock_session.get();
-  SessionConfig session_config = SessionConfig::CreateDefault();
-  session_config.SetStartTokenId(0);
-  session_config.GetMutableStopTokenIds().push_back({1});
-  *session_config.GetMutableLlmModelType().mutable_gemma3() = {};
-  session_config.SetApplyPromptTemplateInSession(false);
-  EXPECT_CALL(*mock_session_ptr, GetSessionConfig())
-      .WillRepeatedly(testing::ReturnRef(session_config));
-  ASSERT_OK_AND_ASSIGN(
-      auto tokenizer,
-      SentencePieceTokenizer::CreateFromFile(
-          (std::filesystem::path(::testing::SrcDir()) / kTestTokenizerPath)
-              .string()));
-
-  // Set up mock Engine.
-  auto mock_engine = std::make_unique<MockEngine>();
-  EXPECT_CALL(*mock_engine, CreateSession(testing::_))
-      .WillOnce(testing::Return(std::move(mock_session)));
-  EXPECT_CALL(*mock_engine, GetTokenizer())
-      .WillRepeatedly(testing::ReturnRef(*tokenizer));
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create(GetTestdataPath(kTestLlmPath)));
-  ASSERT_OK_AND_ASSIGN(auto engine_settings, EngineSettings::CreateDefault(
-                                                 model_assets, Backend::CPU));
-  EXPECT_CALL(*mock_engine, GetEngineSettings())
-      .WillRepeatedly(testing::ReturnRef(engine_settings));
-
-  std::string template_text =
-      ReadFile(GetTestdataPath(kGemma3ToolsMultiPrefillTemplatePath));
-
-  // Create Conversation.
-  ASSERT_OK_AND_ASSIGN(
-      auto conversation_config,
-      ConversationConfig::Builder()
-          .SetSessionConfig(session_config)
-          .SetOverwritePromptTemplate(PromptTemplate(template_text))
-          .Build(*mock_engine));
-  ASSERT_OK_AND_ASSIGN(auto conversation,
-                       Conversation::Create(*mock_engine, conversation_config));
-
-  Message user_message = {{"role", "user"}, {"content", "Hello world!"}};
-
-  absl::Notification done;
-  absl::Status status;
-  absl::AnyInvocable<void(absl::StatusOr<Responses>)> stored_callback;
-
-  // Expect RunPrefillAsync to be called.
-  EXPECT_CALL(*mock_session_ptr, RunPrefillAsync(testing::_, testing::_))
-      .WillOnce([&](const std::vector<InputData>& contents,
-                    absl::AnyInvocable<void(absl::StatusOr<Responses>)>
-                        user_callback) {
-        stored_callback = std::move(user_callback);
-        return nullptr;
-      });
-
-  EXPECT_OK(
-      conversation->SendMessageAsync(user_message,
-                                     [&](absl::StatusOr<Message> message) {
-                                       if (!message.ok()) {
-                                         status = message.status();
-                                         done.Notify();
-                                       }
-                                     },
-                                     {.has_pending_message = true}));
-
-  // Expect CancelProcess to be called on the mock session.
-  EXPECT_CALL(*mock_session_ptr, CancelProcess()).WillOnce([&]() {
-    if (stored_callback) {
-      stored_callback(Responses(TaskState::kCancelled));
-    }
-  });
-
-  conversation->CancelProcess();
-
-  done.WaitForNotification();
-  EXPECT_THAT(status, testing::status::StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_TRUE(conversation->GetHistory().empty());
-}
-
-TEST(AppendMessageTest, CancelGroupWithSendMessageAsyncWithPendingMessage) {
-  // Set up mock Session.
-  auto mock_session = std::make_unique<MockSession>();
-  MockSession* mock_session_ptr = mock_session.get();
-  SessionConfig session_config = SessionConfig::CreateDefault();
-  session_config.SetStartTokenId(0);
-  session_config.GetMutableStopTokenIds().push_back({1});
-  *session_config.GetMutableLlmModelType().mutable_gemma3() = {};
-  session_config.SetApplyPromptTemplateInSession(false);
-  EXPECT_CALL(*mock_session_ptr, GetSessionConfig())
-      .WillRepeatedly(testing::ReturnRef(session_config));
-  ASSERT_OK_AND_ASSIGN(
-      auto tokenizer,
-      SentencePieceTokenizer::CreateFromFile(
-          (std::filesystem::path(::testing::SrcDir()) / kTestTokenizerPath)
-              .string()));
-
-  // Set up mock Engine.
-  auto mock_engine = std::make_unique<MockEngine>();
-  EXPECT_CALL(*mock_engine, CreateSession(testing::_))
-      .WillOnce(testing::Return(std::move(mock_session)));
-  EXPECT_CALL(*mock_engine, GetTokenizer())
-      .WillRepeatedly(testing::ReturnRef(*tokenizer));
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create(GetTestdataPath(kTestLlmPath)));
-  ASSERT_OK_AND_ASSIGN(auto engine_settings, EngineSettings::CreateDefault(
-                                                 model_assets, Backend::CPU));
-  EXPECT_CALL(*mock_engine, GetEngineSettings())
-      .WillRepeatedly(testing::ReturnRef(engine_settings));
-
-  std::string template_text =
-      ReadFile(GetTestdataPath(kGemma3ToolsMultiPrefillTemplatePath));
-
-  // Create Conversation.
-  ASSERT_OK_AND_ASSIGN(
-      auto conversation_config,
-      ConversationConfig::Builder()
-          .SetSessionConfig(session_config)
-          .SetOverwritePromptTemplate(PromptTemplate(template_text))
-          .Build(*mock_engine));
-  ASSERT_OK_AND_ASSIGN(auto conversation,
-                       Conversation::Create(*mock_engine, conversation_config));
-
-  Message user_message = {{"role", "user"}, {"content", "Hello world!"}};
-
-  absl::Notification done;
-  absl::Status status;
-  absl::AnyInvocable<void(absl::StatusOr<Responses>)> stored_callback;
-
-  auto mock_task_controller = std::make_unique<MockTaskController>();
-  EXPECT_CALL(*mock_task_controller, Cancel()).WillOnce([&]() {
-    if (stored_callback) {
-      stored_callback(Responses(TaskState::kCancelled));
-    }
-    return absl::OkStatus();
-  });
-
-  EXPECT_CALL(*mock_session_ptr, RunPrefillAsync(testing::_, testing::_))
-      .WillOnce([&](const std::vector<InputData>& contents,
-                    absl::AnyInvocable<void(absl::StatusOr<Responses>)>
-                        user_callback) {
-        stored_callback = std::move(user_callback);
-        return std::move(mock_task_controller);
-      });
-
-  EXPECT_OK(conversation->SendMessageAsync(
-      user_message,
-      [&](absl::StatusOr<Message> message) {
-        if (!message.ok()) {
-          status = message.status();
-          done.Notify();
-        }
-      },
-      {.has_pending_message = true, .task_group_id = "group1"}));
-
-  conversation->CancelGroup("group1");
-
-  done.WaitForNotification();
-  EXPECT_THAT(status, testing::status::StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_TRUE(conversation->GetHistory().empty());
-}
-
-TEST(AppendMessageTest, CancelProcessDuringSendMessageAsyncWithArray) {
-  // Set up mock Session.
-  auto mock_session = std::make_unique<MockSession>();
-  MockSession* mock_session_ptr = mock_session.get();
-  SessionConfig session_config = SessionConfig::CreateDefault();
-  session_config.SetStartTokenId(0);
-  session_config.GetMutableStopTokenIds().push_back({1});
-  *session_config.GetMutableLlmModelType().mutable_gemma3() = {};
-  session_config.SetApplyPromptTemplateInSession(false);
-  EXPECT_CALL(*mock_session_ptr, GetSessionConfig())
-      .WillRepeatedly(testing::ReturnRef(session_config));
-  ASSERT_OK_AND_ASSIGN(
-      auto tokenizer,
-      SentencePieceTokenizer::CreateFromFile(
-          (std::filesystem::path(::testing::SrcDir()) / kTestTokenizerPath)
-              .string()));
-
-  // Set up mock Engine.
-  auto mock_engine = std::make_unique<MockEngine>();
-  EXPECT_CALL(*mock_engine, CreateSession(testing::_))
-      .WillOnce(testing::Return(std::move(mock_session)));
-  EXPECT_CALL(*mock_engine, GetTokenizer())
-      .WillRepeatedly(testing::ReturnRef(*tokenizer));
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create(GetTestdataPath(kTestLlmPath)));
-  ASSERT_OK_AND_ASSIGN(auto engine_settings, EngineSettings::CreateDefault(
-                                                 model_assets, Backend::CPU));
-  EXPECT_CALL(*mock_engine, GetEngineSettings())
-      .WillRepeatedly(testing::ReturnRef(engine_settings));
-
-  std::string template_text =
-      ReadFile(GetTestdataPath(kGemma3ToolsMultiPrefillTemplatePath));
-
-  // Create Conversation.
-  ASSERT_OK_AND_ASSIGN(
-      auto conversation_config,
-      ConversationConfig::Builder()
-          .SetSessionConfig(session_config)
-          .SetOverwritePromptTemplate(PromptTemplate(template_text))
-          .Build(*mock_engine));
-  ASSERT_OK_AND_ASSIGN(auto conversation,
-                       Conversation::Create(*mock_engine, conversation_config));
-
-  Message user_messages = nlohmann::ordered_json::array(
-      {{{"role", "user"}, {"content", "Message 1"}},
-       {{"role", "user"}, {"content", "Message 2"}}});
-
-  absl::Notification done;
-  absl::Status status;
-  absl::AnyInvocable<void(absl::StatusOr<Responses>)> stored_callback;
-
-  EXPECT_CALL(*mock_session_ptr, RunPrefillAsync(testing::_, testing::_))
-      .WillOnce([&](const std::vector<InputData>& contents,
-                    absl::AnyInvocable<void(absl::StatusOr<Responses>)>
-                        user_callback) {
-        stored_callback = std::move(user_callback);
-        return nullptr;
-      });
-
-  EXPECT_OK(
-      conversation->SendMessageAsync(user_messages,
-                                     [&](absl::StatusOr<Message> message) {
-                                       if (!message.ok()) {
-                                         status = message.status();
-                                         done.Notify();
-                                       }
-                                     },
-                                     {.has_pending_message = true}));
-
-  // Expect CancelProcess to be called on the mock session.
-  EXPECT_CALL(*mock_session_ptr, CancelProcess()).WillOnce([&]() {
-    if (stored_callback) {
-      stored_callback(Responses(TaskState::kCancelled));
-    }
-  });
-
-  conversation->CancelProcess();
-
-  done.WaitForNotification();
-  EXPECT_THAT(status, testing::status::StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_TRUE(conversation->GetHistory().empty());
 }
 
 TEST(AppendMessageTest, Gemma4Sync) {

@@ -244,5 +244,66 @@ TEST(SentencePieceTokenizerTest, TokensTokenIdsToTextOutOfRange) {
               StatusIs(absl::StatusCode::kNotFound));
 }
 
+TEST(SentencePieceTokenizerTest, ConstraintEncodingPreservesFaithfulModelIDs) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetGemma3TokenizerModelPath()));
+  for (const auto& text : {"making every day outdoor", "café 東京 🧭", "a  b"}) {
+    ASSERT_OK_AND_ASSIGN(auto normal, tokenizer->TextToTokenIds(text));
+    ASSERT_OK_AND_ASSIGN(auto constrained,
+                        tokenizer->BytesToTokenIdsForConstraint(text));
+    EXPECT_EQ(constrained, normal);
+  }
+}
+
+TEST(SentencePieceTokenizerTest, ConstraintEncodingPreservesNormalizedCharacters) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetGemma3TokenizerModelPath()));
+  for (const auto& text : {"\"▁🧭\"", "\"<bos>\"", "  \"a\""}) {
+    ASSERT_OK_AND_ASSIGN(auto constrained,
+                        tokenizer->BytesToTokenIdsForConstraint(text));
+    const auto vocabulary = tokenizer->GetConstraintVocabulary();
+    std::string bytes;
+    for (int id : constrained) bytes += vocabulary.token_bytes[id];
+    EXPECT_EQ(bytes, text);
+    ASSERT_OK_AND_ASSIGN(auto decoded, tokenizer->TokenIdsToText(constrained));
+    EXPECT_EQ(decoded, text);
+  }
+}
+
+TEST(SentencePieceTokenizerTest, ConstraintEncodingAvoidsConfiguredStopIDs) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetGemma3TokenizerModelPath()));
+  const std::vector<int> stops = {50, 106};
+  ASSERT_OK_AND_ASSIGN(auto ordinary, tokenizer->TextToTokenIds("<end_of_turn>"));
+  EXPECT_THAT(ordinary, ::testing::ElementsAre(106));
+  for (const auto& text : {"<end_of_turn>", "<unused44>",
+                           "literal <end_of_turn> marker"}) {
+    ASSERT_OK_AND_ASSIGN(auto constrained,
+                        tokenizer->BytesToTokenIdsForConstraint(text, stops));
+    for (int id : constrained) EXPECT_TRUE(id != 50 && id != 106);
+    ASSERT_OK_AND_ASSIGN(auto decoded, tokenizer->TokenIdsToText(constrained));
+    EXPECT_EQ(decoded, text);
+  }
+}
+
+TEST(SentencePieceTokenizerTest, ConstraintEncodingPreservesPartialUnicode) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetGemma3TokenizerModelPath()));
+  const std::string partial("\xf0\x9f\xa7", 3);
+  ASSERT_OK_AND_ASSIGN(auto constrained,
+                      tokenizer->BytesToTokenIdsForConstraint(partial));
+  const auto vocabulary = tokenizer->GetConstraintVocabulary();
+  std::string bytes;
+  for (int id : constrained) bytes += vocabulary.token_bytes[id];
+  EXPECT_EQ(bytes, partial);
+}
+
+TEST(SentencePieceTokenizerTest, ConstraintEncodingRefusesMissingBytePieces) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, SentencePieceTokenizer::CreateFromFile(
+                                           GetSentencePieceModelPath()));
+  EXPECT_THAT(tokenizer->BytesToTokenIdsForConstraint("▁"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 }  // namespace
 }  // namespace litert::support

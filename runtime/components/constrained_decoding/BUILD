@@ -21,6 +21,24 @@ package(
 
 licenses(["notice"])
 
+cc_test(
+    name = "gemma_tool_constraint_abi_test",
+    srcs = ["gemma_tool_constraint_abi_test.cc"],
+    data = ["//runtime/components/testdata:testdata"],
+    deps = [
+        ":composite_constraint",
+        ":constrained_decoder",
+        ":constraint",
+        ":gemma_model_constraint_provider_lib",
+        "//runtime/util:test_utils",
+        "//support/tokenizer:sentencepiece_tokenizer",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+        "@litert//litert/cc:litert_layout",
+        "@litert//tflite/types:half",
+    ],
+)
+
 cc_library(
     name = "bitmap",
     hdrs = ["bitmap.h"],
@@ -278,6 +296,7 @@ cc_library(
         ":constraint_provider_config",
         ":llg_constraint",
         ":llg_constraint_config",
+        "@nlohmann_json//:json",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -413,12 +432,33 @@ cc_test(
 )
 
 cc_test(
+    name = "constraint_vocabulary_test",
+    srcs = ["constraint_vocabulary_test.cc"],
+    data = ["//support/tokenizer/testdata"],
+    deps = [
+        ":constraint",
+        ":constraint_provider_factory",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":logit_mask",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "//support/tokenizer:sentencepiece_tokenizer",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "llg_constraint_test",
     srcs = ["llg_constraint_test.cc"],
     deps = [
         ":bitmap",
         ":constraint",
         ":constraint_provider",
+        ":llg_constraint",
         ":llg_constraint_config",
         ":llg_constraint_provider",
         ":logit_mask",
@@ -484,6 +524,46 @@ cc_test(
 )
 
 cc_library(
+    name = "constraint_provider_cache",
+    srcs = ["constraint_provider_cache.cc"],
+    hdrs = ["constraint_provider_cache.h"],
+    deps = [
+        ":constraint_provider",
+        ":constraint_provider_config",
+        ":constraint_provider_factory",
+        ":llg_constraint_config",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "//support/tokenizer",
+    ],
+)
+
+cc_test(
+    name = "constraint_provider_cache_test",
+    srcs = ["constraint_provider_cache_test.cc"],
+    deps = [
+        ":constraint",
+        ":constraint_provider",
+        ":constraint_provider_config",
+        ":external_constraint_config",
+        ":llg_constraint_config",
+        ":logit_mask",
+        "//runtime/engine:engine_interface",
+        "//runtime/engine:engine_settings",
+        "//runtime/engine:io_types",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "@com_google_googletest//:gtest_main",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
     name = "thinking_budget_constraint",
     srcs = ["thinking_budget_constraint.cc"],
     hdrs = ["thinking_budget_constraint.h"],
@@ -492,7 +572,10 @@ cc_library(
         ":bitmap",
         ":constraint",
         ":logit_mask",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
         "//runtime/util:litert_status_util",
     ],
 )
@@ -679,5 +762,26 @@ cc_test(
         "//runtime/util:test_utils",
         "//support/tokenizer",
         "@litert//tflite/types:half",
+    ],
+)
+
+# Real LLGuidance + thinking transition regressions, independent of model files.
+cc_test(
+    name = "thinking_budget_llguidance_test",
+    srcs = ["thinking_budget_llguidance_test.cc"],
+    deps = [
+        ":bitmap",
+        ":constraint",
+        ":llg_constraint_config",
+        ":llg_constraint_provider",
+        ":logit_mask",
+        ":thinking_budget_constraint",
+        "//runtime/util:test_utils",
+        "//support/tokenizer",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )

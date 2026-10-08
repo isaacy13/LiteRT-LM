@@ -29,6 +29,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/constraint_provider_config.h"
@@ -67,43 +68,97 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
     return absl::InvalidArgumentError("LlGuidanceConfig::eos_id must be set.");
   }
 
-  std::vector<std::string> tokens = tokenizer.GetTokens();
+  auto vocabulary = tokenizer.GetConstraintVocabulary();
+  auto& tokens = vocabulary.token_bytes;
+  if (*llg_config.eos_id >= tokens.size()) {
+    return absl::InvalidArgumentError("LLGuidance EOS is outside vocabulary.");
+  }
+  std::vector<bool> special(tokens.size(), false);
+  vocabulary.special_token_ids.insert(vocabulary.special_token_ids.end(),
+                                     llg_config.special_token_ids.begin(),
+                                     llg_config.special_token_ids.end());
+  if (!llg_config.special_tokens.empty()) {
+    const auto raw_tokens = tokenizer.GetTokens();
+    if (raw_tokens.size() != tokens.size()) {
+      return absl::InvalidArgumentError("Raw and constraint vocabularies differ in size.");
+    }
+    const absl::flat_hash_set<absl::string_view> configured(
+        llg_config.special_tokens.begin(), llg_config.special_tokens.end());
+    for (int id = 0; id < raw_tokens.size(); ++id) {
+      if (configured.contains(raw_tokens[id])) {
+        vocabulary.special_token_ids.push_back(id);
+      }
+    }
+  }
+  vocabulary.special_token_ids.push_back(*llg_config.eos_id);
+  for (int id : vocabulary.special_token_ids) {
+    if (id < 0 || id >= tokens.size()) {
+      return absl::InvalidArgumentError(
+          "LLGuidance special token is outside vocabulary.");
+    }
+    special[id] = true;
+  }
 
-  absl::flat_hash_set<absl::string_view> special_tokens_set(
-      llg_config.special_tokens.begin(), llg_config.special_tokens.end());
+  std::string tokenizer_json;
+  if (vocabulary.tokenizer_json.has_value()) {
+    auto json = nlohmann::json::parse(*vocabulary.tokenizer_json,
+                                     /*cb=*/nullptr, /*allow_exceptions=*/false);
+    if (!json.is_object()) {
+      return absl::InvalidArgumentError("Invalid HF constraint tokenizer JSON.");
+    }
+    auto& added = json["added_tokens"];
+    if (added.is_null()) added = nlohmann::json::array();
+    if (!added.is_array()) {
+      return absl::InvalidArgumentError("HF added_tokens must be an array.");
+    }
+    for (int id = 0; id < special.size(); ++id) {
+      if (!special[id]) continue;
+      bool found = false;
+      for (auto& token : added) {
+        if (token.is_object() && token.contains("id") && token["id"] == id) {
+          token["special"] = true;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        added.push_back({{"id", id}, {"content", tokens[id]}, {"special", true}});
+      }
+    }
+    tokenizer_json = json.dump();
+  } else {
+    for (int id = 0; id < tokens.size(); ++id) {
+      if (special[id] && (tokens[id].empty() ||
+                         static_cast<uint8_t>(tokens[id].front()) != 0xff)) {
+        // llguidance's native marker distinguishes control IDs from text.
+        tokens[id].insert(tokens[id].begin(), static_cast<char>(0xff));
+      }
+    }
+  }
 
   std::vector<uint32_t> token_lens;
   std::vector<uint8_t> token_bytes;
   size_t total_size = 0;
-
   token_lens.reserve(tokens.size());
   for (const auto& token : tokens) {
-    bool is_special = special_tokens_set.contains(token);
-    token_lens.push_back(token.size() + (is_special ? 1 : 0));
-    total_size += token.size() + (is_special ? 1 : 0);
+    token_lens.push_back(token.size());
+    total_size += token.size();
   }
-
   token_bytes.reserve(total_size);
   for (const auto& token : tokens) {
-    bool is_special = special_tokens_set.contains(token);
-    if (is_special) {
-      // Special tokens need to be prefixed with 0xFF.
-      // https://github.com/guidance-ai/llguidance/blob/main/docs/special_tokens.md
-      token_bytes.push_back(0xFF);
-    }
     token_bytes.insert(token_bytes.end(), token.begin(), token.end());
   }
 
+  auto context = std::make_shared<const TokenizationContext>(TokenizationContext{
+      const_cast<Tokenizer&>(tokenizer), vocabulary.special_token_ids});
   auto tokenize_fn = [](const void* user_data, const uint8_t* bytes,
                         size_t bytes_len, uint32_t* output_tokens,
                         size_t output_tokens_len) -> size_t {
     absl::string_view text(reinterpret_cast<const char*>(bytes), bytes_len);
 
-    // The tokenizer is passed as `user_data` to tokenize_fn. It needs to be
-    // cast back into a Tokenizer*.
-    Tokenizer* tokenizer =
-        static_cast<Tokenizer*>(const_cast<void*>(user_data));
-    auto token_ids = tokenizer->TextToTokenIds(text);
+    const auto& context = *static_cast<const TokenizationContext*>(user_data);
+    auto token_ids = context.tokenizer.BytesToTokenIdsForConstraint(
+        text, context.special_token_ids);
     if (!token_ids.ok()) {
       return 0;
     }
@@ -119,9 +174,10 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
       .tok_eos = *llg_config.eos_id,
       .token_lens = token_lens.data(),
       .token_bytes = token_bytes.data(),
-      .tokenize_assumes_string = false,
+      .tokenizer_json = tokenizer_json.empty() ? nullptr : tokenizer_json.c_str(),
+      .tokenize_assumes_string = true,
       .tokenize_fn = tokenize_fn,
-      .tokenize_user_data = &tokenizer,
+      .tokenize_user_data = context.get(),
   };
 
   char error_buf[128];
@@ -132,7 +188,8 @@ LlgConstraintProvider::Create(const Tokenizer& tokenizer,
   }
 
   return std::make_unique<LlgConstraintProvider>(
-      std::move(token_lens), std::move(token_bytes), llg_tokenizer, llg_config);
+      std::move(token_lens), std::move(token_bytes), llg_tokenizer, llg_config,
+      std::move(context));
 }
 
 LlgConstraintProvider::~LlgConstraintProvider() {
@@ -161,7 +218,8 @@ LlgConstraintProvider::CreateConstraint(ConstraintArg constraint_arg) const {
 
   return std::make_unique<LlgConstraint>(llg_constraint,
                                          static_cast<int>(token_lens_.size()),
-                                         *llg_config_.eos_id);
+                                         *llg_config_.eos_id,
+                                         tokenization_context_);
 }
 
 }  // namespace litert::lm

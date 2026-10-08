@@ -30,6 +30,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
@@ -40,15 +41,14 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio/audio_executor.h"
-#include "runtime/executor/audio/audio_executor_settings.h"
+#include "runtime/executor/audio_executor.h"
+#include "runtime/executor/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/framework/resource_management/serial_execution_manager.h"
 #include "runtime/framework/resource_management/threaded_execution_manager.h"
 #include "runtime/proto/token.pb.h"
-#include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "runtime/util/test_utils.h"  // NOLINT
 #include "support/tokenizer/tokenizer.h"
@@ -64,7 +64,6 @@ using ::testing::ElementsAre;
 using ::testing::Return;
 
 constexpr int kVocabSize = 10;
-constexpr int kValidTokensInAudioData = 4;
 
 class MockTokenizer : public Tokenizer {
  public:
@@ -80,88 +79,11 @@ class MockTokenizer : public Tokenizer {
   MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
-class FakeAudioContext : public AudioContext {
- public:
-  FakeAudioContext() = default;
-  absl::StatusOr<std::unique_ptr<AudioContext>> Clone() const override {
-    return std::make_unique<FakeAudioContext>(*this);
-  }
-};
-
 class FakeAudioExecutor : public AudioExecutor {
  public:
-  absl::StatusOr<ExecutorAudioData> Encode(
-      const TensorBuffer& spectrogram_tensor) override {
-    ExecutorAudioData data;
-    data.SetValidTokens(kValidTokensInAudioData);
-    return data;
-  }
-
-  absl::Status Reset() override {
-    reset_called_ = true;
-    return absl::OkStatus();
-  }
-
-  absl::StatusOr<ExecutorAudioData> Flush() override {
-    flush_called_ = true;
-    ExecutorAudioData data;
-    data.SetValidTokens(kValidTokensInAudioData);
-    return data;
-  }
-
-  absl::StatusOr<std::unique_ptr<AudioContext>> CreateNewContext() override {
-    return std::make_unique<FakeAudioContext>();
-  }
-
-  absl::StatusOr<std::unique_ptr<AudioContext>> CloneContext() override {
-    return std::make_unique<FakeAudioContext>();
-  }
-
-  absl::Status RestoreContext(
-      std::unique_ptr<AudioContext> audio_context) override {
-    return absl::OkStatus();
-  }
-
-  bool reset_called_ = false;
-  bool flush_called_ = false;
-};
-
-class NonStreamingFakeAudioExecutor : public AudioExecutor {
- public:
-  absl::StatusOr<ExecutorAudioData> Encode(
-      const TensorBuffer& spectrogram_tensor) override {
-    ExecutorAudioData data;
-    data.SetValidTokens(kValidTokensInAudioData);
-    return data;
-  }
-
-  absl::Status Reset() override {
-    reset_called_ = true;
-    return absl::OkStatus();
-  }
-
-  absl::StatusOr<ExecutorAudioData> Flush() override {
-    flush_called_ = true;
-    ExecutorAudioData data;
-    data.SetValidTokens(0);
-    return data;
-  }
-
-  // Intentionally do NOT override CreateNewContext, CloneContext,
-  // RestoreContext; they return absl::UnimplementedError from
-  // AudioExecutorBase.
-
-  bool reset_called_ = false;
-  bool flush_called_ = false;
-};
-
-class FailingAudioExecutor : public AudioExecutor {
- public:
-  absl::StatusOr<ExecutorAudioData> Encode(
-      const TensorBuffer& spectrogram_tensor) override {
-    return absl::InternalError(
-        "Encode() should not be called when precomputed audio embeddings are "
-        "provided.");
+  absl::StatusOr<::litert::lm::ExecutorAudioData> Encode(
+      const litert::TensorBuffer& spectrogram_tensor) override {
+    return ::litert::lm::ExecutorAudioData();
   }
 };
 
@@ -217,7 +139,8 @@ class ExecutionManagerTest
   void CreateExecutionManager(
       std::unique_ptr<FakeLlmExecutor> fake_llm_executor,
       std::unique_ptr<AudioExecutorSettings> audio_executor_settings = nullptr,
-      std::unique_ptr<AudioExecutor> audio_executor = nullptr) {
+      std::unique_ptr<AudioExecutor> audio_executor = nullptr,
+      ExecutionManager::DecodeInputBufferFactory buffer_factory = nullptr) {
     // The objects are moved to execution_manager_ so we can't access them
     // after creation.
     if (GetParam() == ExecutionManagerType::kThreaded) {
@@ -229,7 +152,8 @@ class ExecutionManagerTest
               /*llm_executor=*/std::move(fake_llm_executor),
               /*vision_executor_settings=*/nullptr,
               std::move(audio_executor_settings),
-              /*litert_env=*/nullptr, std::move(audio_executor)));
+              /*litert_env=*/nullptr, std::move(audio_executor),
+              /*runtime_debugger=*/nullptr, std::move(buffer_factory)));
     } else {
       ASSERT_OK_AND_ASSIGN(
           execution_manager_,
@@ -239,7 +163,8 @@ class ExecutionManagerTest
               /*llm_executor=*/std::move(fake_llm_executor),
               /*vision_executor_settings=*/nullptr,
               std::move(audio_executor_settings),
-              /*litert_env=*/nullptr, std::move(audio_executor)));
+              /*litert_env=*/nullptr, std::move(audio_executor),
+              /*runtime_debugger=*/nullptr, std::move(buffer_factory)));
     }
   }
 
@@ -335,10 +260,9 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(
-      auto audio_settings,
-      AudioExecutorSettings::CreateDefault(
-          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(auto audio_settings,
+                       AudioExecutorSettings::CreateDefault(
+                           model_assets, 128, Backend::GPU_ARTISAN));
 
   CreateExecutionManager(
       std::move(fake_llm_executor),
@@ -365,162 +289,6 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
       std::make_shared<std::atomic<bool>>(false), nullptr));
 
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
-}
-
-TEST_P(ExecutionManagerTest, EncodeAudioWithSessionInfo) {
-  auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
-
-  ASSERT_OK_AND_ASSIGN(auto* settings,
-                       fake_llm_executor->GetMutableExecutorSettings());
-  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
-
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(
-      auto audio_settings,
-      AudioExecutorSettings::CreateDefault(
-          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
-
-  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
-  auto* fake_audio_executor_ptr = fake_audio_executor.get();
-
-  CreateExecutionManager(
-      std::move(fake_llm_executor),
-      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
-      std::move(fake_audio_executor));
-
-  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
-  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
-                       execution_manager_->RegisterNewSession(session_config));
-  ASSERT_OK_AND_ASSIGN(auto session_info,
-                       execution_manager_->GetSessionInfo(session_id));
-
-  const std::vector<float> kSpectrogramData = {1.0f, 2.0f, 3.0f, 4.0f};
-  auto tensor_or = CopyToTensorBuffer<float>(kSpectrogramData, {1, 4});
-  ASSERT_TRUE(tensor_or.HasValue());
-
-  ASSERT_OK_AND_ASSIGN(auto audio_data, execution_manager_->EncodeAudio(
-                                            *session_info, *tensor_or));
-  EXPECT_EQ(audio_data.GetValidTokens(), 4);
-
-  EXPECT_OK(execution_manager_->ResetAudio(*session_info));
-  EXPECT_TRUE(fake_audio_executor_ptr->reset_called_);
-
-  ASSERT_OK_AND_ASSIGN(auto flush_data,
-                       execution_manager_->FlushAudio(*session_info));
-  EXPECT_EQ(flush_data.GetValidTokens(), 4);
-  EXPECT_TRUE(fake_audio_executor_ptr->flush_called_);
-}
-
-TEST_P(ExecutionManagerTest, EncodeAudioWithNonStreamingAudioExecutor) {
-  auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
-
-  ASSERT_OK_AND_ASSIGN(auto* settings,
-                       fake_llm_executor->GetMutableExecutorSettings());
-  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
-
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(
-      auto audio_settings,
-      AudioExecutorSettings::CreateDefault(
-          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
-
-  auto fake_audio_executor = std::make_unique<NonStreamingFakeAudioExecutor>();
-  auto* fake_audio_executor_ptr = fake_audio_executor.get();
-
-  CreateExecutionManager(
-      std::move(fake_llm_executor),
-      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
-      std::move(fake_audio_executor));
-
-  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
-  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
-                       execution_manager_->RegisterNewSession(session_config));
-  ASSERT_OK_AND_ASSIGN(auto session_info,
-                       execution_manager_->GetSessionInfo(session_id));
-
-  const std::vector<float> kSpectrogramData = {1.0f, 2.0f, 3.0f, 4.0f};
-  auto tensor_or = CopyToTensorBuffer<float>(kSpectrogramData, {1, 4});
-  ASSERT_TRUE(tensor_or.HasValue());
-
-  ASSERT_OK_AND_ASSIGN(auto audio_data, execution_manager_->EncodeAudio(
-                                            *session_info, *tensor_or));
-  EXPECT_EQ(audio_data.GetValidTokens(), 4);
-
-  EXPECT_OK(execution_manager_->ResetAudio(*session_info));
-  EXPECT_TRUE(fake_audio_executor_ptr->reset_called_);
-
-  ASSERT_OK_AND_ASSIGN(auto flush_data,
-                       execution_manager_->FlushAudio(*session_info));
-  EXPECT_EQ(flush_data.GetValidTokens(), 0);
-  EXPECT_TRUE(fake_audio_executor_ptr->flush_called_);
-}
-
-TEST_P(ExecutionManagerTest, AddPrefillTaskWithPrecomputedAudioEmbeddings) {
-  const std::vector<float> kEmbeddingData = {1.0f, 2.0f, 3.0f, 4.0f,
-                                             5.0f, 6.0f, 7.0f, 8.0f};
-  auto embedding_tensor_or = CopyToTensorBuffer<float>(kEmbeddingData, {2, 4});
-  ASSERT_TRUE(embedding_tensor_or.HasValue());
-  auto embedding_tensor = std::move(*embedding_tensor_or);
-
-  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
-      kVocabSize,
-      std::vector<std::vector<int>>{{1, 2, 3, ExecutorAudioData::kSpecialToken,
-                                     ExecutorAudioData::kSpecialToken,
-                                     ExecutorAudioData::kEndToken}},
-      std::vector<std::vector<int>>{{4}, {5}, {6}},
-      /*batch_size=*/1,
-      /*projected_audio_embedding=*/kEmbeddingData);
-
-  ASSERT_OK_AND_ASSIGN(auto* settings,
-                       fake_llm_executor->GetMutableExecutorSettings());
-  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
-
-  ASSERT_OK_AND_ASSIGN(auto model_assets,
-                       ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(
-      auto audio_settings,
-      AudioExecutorSettings::CreateDefault(
-          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
-
-  CreateExecutionManager(
-      std::move(fake_llm_executor),
-      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
-      std::make_unique<FailingAudioExecutor>());
-
-  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
-  session_config.SetAudioModalityEnabled(true);
-
-  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
-                       execution_manager_->RegisterNewSession(session_config));
-
-  std::vector<InputData> inputs;
-  ASSERT_OK_AND_ASSIGN(auto input_text,
-                       tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
-  inputs.push_back(InputText(std::move(input_text)));
-  inputs.push_back(
-      InputAudio(std::move(embedding_tensor), /*is_embeddings=*/true));
-  inputs.push_back(InputAudioEnd());
-
-  std::vector<TaskState> task_states;
-  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
-      [&task_states](absl::StatusOr<Responses> responses) {
-        ASSERT_OK(responses);
-        task_states.push_back(responses->GetTaskState());
-      };
-
-  ASSERT_OK_AND_ASSIGN(const TaskId task_id,
-                       execution_manager_->GetNewTaskId());
-  ASSERT_OK(execution_manager_->AddPrefillTask(
-      session_id, task_id, std::move(inputs), {},
-      std::make_shared<std::atomic<bool>>(false), std::move(callback)));
-
-  EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
-
-  EXPECT_THAT(task_states,
-              ElementsAre(TaskState::kCreated, TaskState::kQueued,
-                          TaskState::kProcessing, TaskState::kDone));
 }
 
 TEST_P(ExecutionManagerTest, AddPrefillTaskInvalidAudioInput) {
@@ -661,6 +429,82 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithInternalSampler) {
                           TaskState::kProcessing, TaskState::kDone));
 
   EXPECT_THAT(responses_texts, ElementsAre("4", "5"));
+}
+
+TEST_P(ExecutionManagerTest, DecodeBufferAllocationFailureFinishesAndAllowsFreshSession) {
+  auto allocations = std::make_shared<std::atomic<int>>(0);
+  ExecutionManager::DecodeInputBufferFactory buffer_factory =
+      [allocations](absl::Span<const int> ids)
+          -> absl::StatusOr<::litert::TensorBuffer> {
+    if (allocations->fetch_add(1) == 0) {
+      return absl::ResourceExhaustedError("Injected decoded-ID allocation failure");
+    }
+    return ExecutionManager::AllocateDecodeInputBuffer(ids);
+  };
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(), nullptr, nullptr,
+                         std::move(buffer_factory));
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig(
+                                                /*use_external_sampler=*/true));
+
+  // The failed task must release active-task/executor ownership before a fresh
+  // session exercises the normal native allocator on this same manager.
+  for (bool should_fail : {true, false}) {
+    ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                         execution_manager_->RegisterNewSession(session_config));
+    ASSERT_OK_AND_ASSIGN(auto input_text,
+                         tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
+    std::vector<InputData> inputs;
+    inputs.push_back(InputText(std::move(input_text)));
+    ASSERT_OK_AND_ASSIGN(const TaskId prefill_task_id,
+                         execution_manager_->GetNewTaskId());
+    ASSERT_OK(execution_manager_->AddPrefillTask(
+        session_id, prefill_task_id, std::move(inputs),
+        /*dependency_task_ids=*/{},
+        /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+        /*callback=*/[](absl::StatusOr<Responses> responses) {
+          EXPECT_OK(responses);
+        }));
+    ASSERT_OK(execution_manager_->WaitUntilDone(prefill_task_id, absl::Seconds(3)));
+
+    int error_callbacks = 0;
+    int successful_terminal_callbacks = 0;
+    std::vector<std::string> texts;
+    ASSERT_OK_AND_ASSIGN(const TaskId decode_task_id,
+                         execution_manager_->GetNewTaskId());
+    ASSERT_OK(execution_manager_->AddDecodeTask(
+        session_id, decode_task_id, /*dependency_task_ids=*/{},
+        RepetitionPenaltyConfig::Default(), NoRepeatNgramConfig::Default(),
+        SuppressTokensConfig::Default(), /*constraint=*/nullptr,
+        /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+        [should_fail, &error_callbacks, &successful_terminal_callbacks, &texts](
+            absl::StatusOr<Responses> responses) {
+          if (!responses.ok()) {
+            ++error_callbacks;
+            EXPECT_TRUE(should_fail);
+            EXPECT_EQ(responses.status().code(), absl::StatusCode::kResourceExhausted);
+            EXPECT_EQ(responses.status().message(), "Injected decoded-ID allocation failure");
+            return;
+          }
+          if (IsTaskEndState(responses->GetTaskState())) {
+            ++successful_terminal_callbacks;
+          }
+          if (!responses->GetTexts().empty()) {
+            texts.push_back(responses->GetTexts()[0]);
+          }
+        }));
+    EXPECT_OK(execution_manager_->WaitUntilDone(decode_task_id, absl::Seconds(1)));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::Seconds(1)));
+    ASSERT_OK(execution_manager_->WaitUntilAllDone(absl::Seconds(1)));
+    EXPECT_EQ(error_callbacks, should_fail ? 1 : 0);
+    EXPECT_EQ(successful_terminal_callbacks, should_fail ? 0 : 1);
+    if (should_fail) {
+      EXPECT_TRUE(texts.empty());
+    } else {
+      EXPECT_THAT(texts, ElementsAre("4", "5"));
+    }
+    EXPECT_OK(execution_manager_->ReleaseSession(session_id));
+  }
+  EXPECT_EQ(allocations->load(), 2);
 }
 
 TEST_P(ExecutionManagerTest, AddDecodeTaskWithExternalSampler) {
@@ -819,13 +663,6 @@ TEST_P(ExecutionManagerTest, CreateTaskWithInvalidDependencyId) {
 }
 
 TEST_P(ExecutionManagerTest, WaitUntilTaskDoneTimeout) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    // Serial execution is synchronous, so it won't timeout unless the task
-    // itself takes longer than the timeout and we have some way to interrupt.
-    // But currently AddDecodeTask will block until done.
-    // So this test is only meaningful for Threaded.
-    GTEST_SKIP() << "Skipping timeout test for SerialExecutionManager";
-  }
   auto prefill_tokens = std::vector<std::vector<int>>{};
   auto decode_tokens = std::vector<std::vector<int>>{};
   decode_tokens.push_back({4});
@@ -856,19 +693,26 @@ TEST_P(ExecutionManagerTest, WaitUntilTaskDoneTimeout) {
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
 
-  EXPECT_EQ(
-      execution_manager_->WaitUntilDone(task_id, absl::Milliseconds(100)),
-      absl::DeadlineExceededError(absl::StrCat(
-          "Task ", task_id, " did not complete within the timeout of 100ms.")));
+  const auto wait_started = absl::Now();
+  const auto wait_status =
+      execution_manager_->WaitUntilDone(task_id, absl::Milliseconds(100));
+  if (GetParam() == ExecutionManagerType::kSerial) {
+    // Serial waits drive queued execution and cannot interrupt a running decode.
+    // The completed task wins after that decode; zero-time waits then succeed.
+    EXPECT_OK(wait_status);
+    EXPECT_GE(absl::Now() - wait_started, absl::Milliseconds(500));
+    EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::ZeroDuration()));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::ZeroDuration()));
+  } else {
+    EXPECT_EQ(wait_status, absl::DeadlineExceededError(absl::StrCat(
+        "Task ", task_id, " did not complete within the timeout of 100ms.")));
+  }
 
   // Wait for the task to actually finish to avoid use after free.
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
 }
 
 TEST_P(ExecutionManagerTest, WaitUntilAllDoneTimeout) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    GTEST_SKIP() << "Skipping timeout test for SerialExecutionManager";
-  }
   auto prefill_tokens = std::vector<std::vector<int>>{};
   auto decode_tokens = std::vector<std::vector<int>>{};
   decode_tokens.push_back({4});
@@ -899,9 +743,17 @@ TEST_P(ExecutionManagerTest, WaitUntilAllDoneTimeout) {
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
 
-  EXPECT_EQ(
-      execution_manager_->WaitUntilAllDone(absl::Milliseconds(100)).code(),
-      absl::StatusCode::kDeadlineExceeded);
+  const auto wait_started = absl::Now();
+  const auto wait_status =
+      execution_manager_->WaitUntilAllDone(absl::Milliseconds(100));
+  if (GetParam() == ExecutionManagerType::kSerial) {
+    EXPECT_OK(wait_status);
+    EXPECT_GE(absl::Now() - wait_started, absl::Milliseconds(500));
+    EXPECT_OK(execution_manager_->WaitUntilAllDone(absl::ZeroDuration()));
+    EXPECT_OK(execution_manager_->WaitUntilSessionDone(session_id, absl::ZeroDuration()));
+  } else {
+    EXPECT_EQ(wait_status.code(), absl::StatusCode::kDeadlineExceeded);
+  }
 
   // Wait for the task to actually finish to avoid use after free.
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
@@ -1621,9 +1473,6 @@ TEST_P(ExecutionManagerTest, SetCurrentStep) {
 }
 
 TEST_P(ExecutionManagerTest, DestructorWaitsForActiveTasks) {
-  if (GetParam() == ExecutionManagerType::kSerial) {
-    GTEST_SKIP() << "Skipping for SerialExecutionManager as it is synchronous";
-  }
   auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
   fake_llm_executor->SetDecodeDelay(absl::Milliseconds(500));
   CreateExecutionManager(std::move(fake_llm_executor));

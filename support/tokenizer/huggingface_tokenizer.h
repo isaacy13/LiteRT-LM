@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
@@ -61,15 +62,21 @@ class HuggingFaceTokenizer : public Tokenizer {
 
   std::vector<std::string> GetTokens() const override;
 
+  ConstraintVocabulary GetConstraintVocabulary() const override {
+    return ConstraintVocabulary{.token_bytes = GetTokens(),
+                                .tokenizer_json = tokenizer_json_};
+  }
+
   int GetVocabSize() const override;
 
  private:
   // Constructor.
-  explicit HuggingFaceTokenizer(TokenizerHandle absl_nonnull handle)
-      : handle_(handle) {};
+  HuggingFaceTokenizer(TokenizerHandle absl_nonnull handle, std::string json)
+      : handle_(handle), tokenizer_json_(std::move(json)) {};
 
   // HuggingFace processor.
   TokenizerHandle absl_nonnull handle_;
+  const std::string tokenizer_json_;
 };
 
 }  // namespace litert::support

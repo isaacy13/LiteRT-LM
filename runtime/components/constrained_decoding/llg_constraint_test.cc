@@ -26,6 +26,7 @@
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/constraint_provider.h"
+#include "runtime/components/constrained_decoding/llg_constraint.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
 #include "runtime/components/constrained_decoding/logit_mask.h"
@@ -70,6 +71,7 @@ class LlgConstraintTest : public ::testing::Test {
           if (text == "b") return TokenIds{3};
           if (text == "\"") return TokenIds{4};
           if (text == "ab") return TokenIds{2, 3};
+          if (text == "aa") return TokenIds{2, 2};
           return TokenIds{};
         });
 
@@ -87,6 +89,30 @@ TEST_F(LlgConstraintTest, GetVocabularySize) {
                            .constraint_type = LlgConstraintType::kRegex,
                            .constraint_string = "a+"}));
   EXPECT_EQ(constraint->GetVocabularySize(), 5);
+}
+
+TEST_F(LlgConstraintTest, ClonedStatesRetainCallbackContextUntilLastOwner) {
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateProvider());
+  ASSERT_OK_AND_ASSIGN(auto original, provider->CreateConstraint(
+      LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kRegex,
+                             .constraint_string = "a+"}));
+  auto original_state = original->Start();
+  auto* native = static_cast<LlgConstraint::LlgState*>(original_state.get());
+  auto context = std::make_shared<int>(42);
+  std::weak_ptr<const void> lifetime = context;
+  auto constraint = std::make_unique<LlgConstraint>(
+      llg_clone_constraint(native->llg_constraint()), 5, 1, context);
+  context.reset();
+  auto state = constraint->Start();
+  auto copy = std::make_unique<LlgConstraint::LlgState>(
+      *static_cast<LlgConstraint::LlgState*>(state.get()));
+  constraint.reset();
+  state.reset();
+  EXPECT_FALSE(lifetime.expired());
+  LlgMaskResult mask;
+  EXPECT_EQ(llg_compute_mask(copy->llg_constraint(), &mask), 0);
+  copy.reset();
+  EXPECT_TRUE(lifetime.expired());
 }
 
 TEST_F(LlgConstraintTest, ComputeBitmap) {
@@ -159,6 +185,57 @@ TEST_F(LlgConstraintTest, InvalidTransition) {
 
   std::unique_ptr<Constraint::State> state = constraint->Start();
   auto next_state_or = constraint->ComputeNext(*state, 3);  // b
+}
+
+TEST_F(LlgConstraintTest, DraftRejectionPreservesEveryGrammarPosition) {
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateProvider());
+  ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
+      LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kRegex,
+                             .constraint_string = "a[ab]"}));
+  auto initial = constraint->Start();
+  ASSERT_OK(constraint->ComputeMask(*initial));
+  ASSERT_OK_AND_ASSIGN(auto accepted_prefix,
+                       constraint->ComputeNext(*initial, 2));
+  ASSERT_OK_AND_ASSIGN(auto prefix_mask,
+                       constraint->ComputeMask(*accepted_prefix));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*prefix_mask).IsAllowed(2));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*prefix_mask).IsAllowed(3));
+  ASSERT_OK_AND_ASSIGN(auto rejected_draft,
+                       constraint->ComputeNext(*accepted_prefix, 3));
+
+  // MTP verifies the original position and each draft position separately.
+  ASSERT_OK_AND_ASSIGN(auto initial_mask, constraint->ComputeMask(*initial));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*initial_mask).IsAllowed(2));
+  EXPECT_FALSE(static_cast<const BitmapLogitMask&>(*initial_mask).IsAllowed(3));
+  ASSERT_OK_AND_ASSIGN(prefix_mask, constraint->ComputeMask(*accepted_prefix));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*prefix_mask).IsAllowed(2));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*prefix_mask).IsAllowed(3));
+  ASSERT_OK_AND_ASSIGN(auto draft_mask,
+                       constraint->ComputeMask(*rejected_draft));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*draft_mask).IsAllowed(1));
+  EXPECT_FALSE(static_cast<const BitmapLogitMask&>(*draft_mask).IsAllowed(2));
+
+  // Reject the drafted b and commit the verifier's a at the accepted prefix.
+  rejected_draft.reset();
+  ASSERT_OK_AND_ASSIGN(auto verified,
+                       constraint->ComputeNext(*accepted_prefix, 2));
+  ASSERT_OK_AND_ASSIGN(auto verified_mask, constraint->ComputeMask(*verified));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*verified_mask).IsAllowed(1));
+  ASSERT_OK_AND_ASSIGN(prefix_mask, constraint->ComputeMask(*accepted_prefix));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*prefix_mask).IsAllowed(3));
+}
+
+TEST_F(LlgConstraintTest, FailedCommitDoesNotPoisonInputState) {
+  ASSERT_OK_AND_ASSIGN(auto provider, CreateProvider());
+  ASSERT_OK_AND_ASSIGN(auto constraint, provider->CreateConstraint(
+      LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kRegex,
+                             .constraint_string = "ab"}));
+  auto state = constraint->Start();
+  ASSERT_OK(constraint->ComputeMask(*state));
+  EXPECT_FALSE(constraint->ComputeNext(*state, 3).ok());
+  ASSERT_OK_AND_ASSIGN(auto mask, constraint->ComputeMask(*state));
+  EXPECT_TRUE(static_cast<const BitmapLogitMask&>(*mask).IsAllowed(2));
+  EXPECT_FALSE(static_cast<const BitmapLogitMask&>(*mask).IsAllowed(3));
 }
 
 TEST_F(LlgConstraintTest, LarkConstraint) {

@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_SUPPORT_TOKENIZER_TOKENIZER_H_
 #define THIRD_PARTY_ODML_LITERT_LM_SUPPORT_TOKENIZER_TOKENIZER_H_
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,14 @@ enum class TokenizerType {
   kUnspecified,
   kSentencePiece,
   kHuggingFace,
+};
+
+// Bytes describe continuation decoding, not raw vocabulary spellings or a
+// single-token BOS decode. Native decoder metadata may supply this mapping.
+struct ConstraintVocabulary {
+  std::vector<std::string> token_bytes;
+  std::vector<int> special_token_ids;
+  std::optional<std::string> tokenizer_json;
 };
 
 class Tokenizer {
@@ -79,6 +88,28 @@ class Tokenizer {
 
   // Returns the list of tokens in the tokenizer.
   virtual std::vector<std::string> GetTokens() const = 0;
+
+  // Identity decoders may use the default. Encoded vocabularies must provide
+  // decoded bytes or their native decoder metadata without changing GetTokens.
+  virtual ConstraintVocabulary GetConstraintVocabulary() const {
+    return ConstraintVocabulary{.token_bytes = GetTokens()};
+  }
+
+  // Preserve requested bytes without BOS insertion or source normalization.
+  virtual absl::StatusOr<TokenIds> BytesToTokenIdsForConstraint(
+      absl::string_view bytes, absl::Span<const int> excluded_token_ids = {}) {
+    auto encoded = TextToTokenIds(bytes);
+    if (!encoded.ok()) return encoded;
+    for (int id : *encoded) {
+      for (int excluded : excluded_token_ids) {
+        if (id == excluded) {
+          return absl::InvalidArgumentError(
+              "Constraint text encoded as a reserved control token.");
+        }
+      }
+    }
+    return encoded;
+  }
 
   // Returns the size of the vocabulary.
   virtual int GetVocabSize() const = 0;

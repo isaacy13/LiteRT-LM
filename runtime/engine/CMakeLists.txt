@@ -28,6 +28,7 @@ target_link_libraries(runtime_engine_engine_interface
   INTERFACE
     LiteRTLM::Runtime::Engine::Settings
     LiteRTLM::Runtime::Engine::IoTypes
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::ProviderCache
     LiteRTLM::Runtime::Components::TokenizerInterface
     LITERTLM_DEPS
 )

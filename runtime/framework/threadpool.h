@@ -24,6 +24,7 @@
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "runtime/framework/thread_options.h"
@@ -67,6 +68,11 @@ class ThreadPool {
   // scheduled.
   absl::Status Schedule(absl::AnyInvocable<void() &&> callback);
 
+  // On success consumes callback and enqueues it exactly once. On error leaves
+  // callback owned by the caller and does not enqueue or execute it. This lets
+  // terminal owners finish accepted work without allocating another worker.
+  absl::Status TrySchedule(absl::AnyInvocable<void() &&>& callback);
+
   // Waits until the task queue is empty. The function will return an error if
   // the timeout is reached before the task queue is empty.
   // Note that this only indicates that there are no pending callbacks in the
@@ -94,6 +100,11 @@ class ThreadPool {
 
  private:
   friend class WorkerThread;
+  friend class SchedulingLifetimeTestPeer;
+  // Instance-owned test seam; ordinary pools always use WorkerThread::Create.
+  using WorkerFactory = absl::AnyInvocable<
+      absl::StatusOr<std::unique_ptr<WorkerThread>>(ThreadPool*,
+                                                const std::string&)>;
 
   const std::string name_prefix_;
   // The number of threads in the pool.
@@ -108,6 +119,7 @@ class ThreadPool {
   std::vector<std::unique_ptr<WorkerThread>> threads_ ABSL_GUARDED_BY(mutex_);
   // Whether the pool is stopped.
   bool stopped_ ABSL_GUARDED_BY(mutex_) = false;
+  WorkerFactory worker_factory_for_test_ ABSL_GUARDED_BY(mutex_);
   // The tasks are stored in a queue using the Schedule() method and will be
   // executed by the threads.
   std::deque<absl::AnyInvocable<void() &&>> tasks_ ABSL_GUARDED_BY(mutex_);

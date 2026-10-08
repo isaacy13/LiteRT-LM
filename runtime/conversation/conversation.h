@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_CONVERSATION_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_CONVERSATION_H_
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -614,6 +615,25 @@ class Conversation {
   // Returns the configuration used for creating the Conversation.
   const ConversationConfig& GetConfig() const { return config_; }
 
+  // Counts canonical processed first-input text on a private fresh probe.
+  // No existing conversation/session is accepted or mutated. Borrow Engine
+  // exclusively and keep it alive; serialize shared tokenizer/engine operations.
+  // Require deferred preface, no pending append/forced benchmark, text-only
+  // messages, and explicit integer extra_context.now. The result binds these
+  // exact frozen values, not a later rebuild or an existing/live KV cache.
+  // OptionalArgs is borrowed const (may own a move-only constraint). Keep it
+  // alive and unchanged until this synchronous operation returns; no option is
+  // consumed or reconstructed, and no caller reference escapes. The C factory
+  // supplies locally owned converted options.
+  // Reuse the same values and Engine for an independently created first Send.
+  // The private shell creates no Session/context/KV/sampler/worker state. Its
+  // data processor/parser/token buffers may allocate; no user-media I/O occurs.
+  // Custom Engines that alter session resolution differently are outside this
+  // contract; the default engine and census share the same resolution helper.
+  static absl::StatusOr<std::size_t> CountFirstInputTextTokens(
+      Engine& engine, const ConversationConfig& config, const Message& message,
+      const OptionalArgs& optional_args);
+
   // Returns the number of tokens in the conversation KV Cache (prefill +
   // decode).
   absl::StatusOr<int> GetTokenCount() const;
@@ -677,7 +697,7 @@ class Conversation {
       Engine& engine, std::unique_ptr<Engine::Session> session,
       std::unique_ptr<ModelDataProcessor> model_data_processor, Preface preface,
       PromptTemplate prompt_template, ConversationConfig config,
-      std::unique_ptr<ConstraintProvider> constraint_provider = nullptr)
+      std::shared_ptr<const ConstraintProvider> constraint_provider = nullptr)
       : engine_(engine),
         model_data_processor_(std::move(model_data_processor)),
         preface_(preface),
@@ -784,7 +804,7 @@ class Conversation {
   // if any.
   std::unique_ptr<Constraint> constraint_;
   const ConversationConfig config_;
-  std::unique_ptr<ConstraintProvider> constraint_provider_ = nullptr;
+  std::shared_ptr<const ConstraintProvider> constraint_provider_ = nullptr;
   mutable absl::Mutex history_mutex_;
   std::vector<Message> history_ ABSL_GUARDED_BY(history_mutex_);
 

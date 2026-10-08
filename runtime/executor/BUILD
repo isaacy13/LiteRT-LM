@@ -511,6 +511,7 @@ cc_test(
     deps = [
         ":fake_llm_executor",
         ":llm_executor_io_types",
+        ":llm_executor_processed_tokens",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/time",

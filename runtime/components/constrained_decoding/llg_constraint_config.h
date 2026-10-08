@@ -44,6 +44,8 @@ struct LlGuidanceConfig {
   // as bytes:
   // https://github.com/guidance-ai/llguidance/blob/main/docs/special_tokens.md
   std::vector<std::string> special_tokens;
+  // Additional control IDs, including all configured single-token stops.
+  std::vector<int> special_token_ids;
 };
 
 struct LlGuidanceConstraintArg {

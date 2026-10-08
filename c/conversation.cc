@@ -14,7 +14,9 @@
 
 #include "c/conversation.h"
 
+#include <exception>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -70,10 +72,9 @@ CreateConversationCallback(LiteRtLmStreamCallback callback, void* user_data) {
 }
 
 std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
-    const litert::lm::Conversation* conversation,
+    const litert::lm::ConversationConfig& config,
     const int visual_token_budget) {
-  bool is_gemma4 = conversation->GetConfig()
-                       .GetSessionConfig()
+  bool is_gemma4 = config.GetSessionConfig()
                        .GetLlmModelType()
                        .has_gemma4();
   if (is_gemma4) {
@@ -84,7 +85,7 @@ std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
 }
 
 litert::lm::OptionalArgs CreateOptionalArgs(
-    const litert::lm::Conversation* conversation, const char* extra_context,
+    const litert::lm::ConversationConfig& config, const char* extra_context,
     const LiteRtLmConversationOptionalArgs* optional_args) {
   litert::lm::OptionalArgs litert_lm_optional_args;
   if (extra_context) {
@@ -109,7 +110,7 @@ litert::lm::OptionalArgs CreateOptionalArgs(
     }
     if (optional_args->visual_token_budget.has_value()) {
       litert_lm_optional_args.args = GetDataProcessorArguments(
-          conversation, *optional_args->visual_token_budget);
+          config, *optional_args->visual_token_budget);
     }
     if (optional_args->max_output_tokens.has_value()) {
       litert_lm_optional_args.max_output_tokens =
@@ -144,6 +145,138 @@ using ::litert::lm::ConversationConfig;
 using ::litert::lm::OptionalArgs;
 using ::litert::lm::SessionConfig;
 using ::litert::lm::c::SetLastError;
+
+namespace {
+absl::StatusOr<ConversationConfig> BuildConversationConfig(
+    LiteRtLmEngine* engine, const LiteRtLmConversationConfig* c_config) {
+  if (c_config) {
+    litert::lm::JsonPreface json_preface;
+    if (!c_config->system_message_json.empty()) {
+      nlohmann::ordered_json system_message;
+      system_message["role"] = "system";
+      auto content = nlohmann::ordered_json::parse(
+          c_config->system_message_json, nullptr, false);
+      if (content.is_discarded()) {
+        system_message["content"] = c_config->system_message_json;
+      } else {
+        system_message["content"] = content;
+      }
+      json_preface.messages = nlohmann::ordered_json::array({system_message});
+    }
+
+    if (!c_config->messages_json.empty()) {
+      auto messages = nlohmann::ordered_json::parse(c_config->messages_json,
+                                                    nullptr, false);
+      if (messages.is_discarded()) {
+        ABSL_LOG(ERROR) << "Failed to parse messages JSON.";
+      } else if (!messages.is_array()) {
+        ABSL_LOG(ERROR) << "Messages JSON is not an array.";
+      } else {
+        if (json_preface.messages.is_array()) {
+          json_preface.messages.insert(json_preface.messages.end(),
+                                       messages.begin(), messages.end());
+        } else {
+          json_preface.messages = std::move(messages);
+        }
+      }
+    }
+
+    if (!c_config->tools_json.empty()) {
+      auto tool_json_parsed =
+          nlohmann::ordered_json::parse(c_config->tools_json, nullptr, false);
+      if (!tool_json_parsed.is_discarded() && tool_json_parsed.is_array()) {
+        json_preface.tools = tool_json_parsed;
+      } else {
+        ABSL_LOG(ERROR) << "Failed to parse tools JSON or not an array: "
+                        << c_config->tools_json;
+      }
+    }
+
+    if (!c_config->extra_context_json.empty()) {
+      auto extra_context_parsed = nlohmann::ordered_json::parse(
+          c_config->extra_context_json, nullptr, false);
+      if (!extra_context_parsed.is_discarded() &&
+          extra_context_parsed.is_object()) {
+        json_preface.extra_context = std::move(extra_context_parsed);
+      } else {
+        ABSL_LOG(ERROR)
+            << "Failed to parse extra context JSON or not an object: "
+            << c_config->extra_context_json;
+      }
+    }
+
+    auto builder = litert::lm::ConversationConfig::Builder();
+    SessionConfig session_config = c_config->session_config
+                                       ? *c_config->session_config
+                                       : SessionConfig::CreateDefault();
+    if (engine->engine->GetEngineSettings()
+            .GetAudioExecutorSettings()
+            .has_value()) {
+      session_config.SetAudioModalityEnabled(true);
+    }
+    if (engine->engine->GetEngineSettings()
+            .GetVisionExecutorSettings()
+            .has_value()) {
+      session_config.SetVisionModalityEnabled(true);
+    }
+    builder.SetSessionConfig(session_config);
+
+    builder.SetPreface(json_preface);
+    builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
+
+    if (c_config->constraint_provider_type.has_value() &&
+        *c_config->constraint_provider_type ==
+            kLiteRtLmConstraintProviderTypeLlGuidance) {
+      builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig());
+    }
+
+    if (c_config->filter_channel_content_from_kv_cache.has_value()) {
+      builder.SetFilterChannelContentFromKvCache(
+          *c_config->filter_channel_content_from_kv_cache);
+    }
+    builder.SetStreamToolCalls(c_config->stream_tool_calls,
+                               c_config->stream_tool_calls_channel_name);
+    if (!c_config->prompt_template.empty()) {
+      builder.SetOverwritePromptTemplate(
+          litert::lm::PromptTemplate(c_config->prompt_template));
+    }
+    if (c_config->thinking_config.has_value()) {
+      builder.SetThinkingConfig(*c_config->thinking_config);
+    }
+    // For disabling rewinding, we don't use a config, but instead force the
+    // option if and only if GPU artisan ringbuffers are being used in the
+    // engine.
+    auto& main_settings =
+        engine->engine->GetEngineSettings().GetMainExecutorSettings();
+    auto gpu_artisan_config =
+        main_settings.GetBackendConfig<litert::lm::GpuArtisanConfig>();
+    if (gpu_artisan_config.ok() &&
+        gpu_artisan_config->use_autosized_ringbuffers) {
+      builder.SetEnableRewinding(false);
+    }
+    auto config = builder.Build(*engine->engine);
+
+    if (!config.ok()) {
+      ABSL_LOG(ERROR) << "Failed to create conversation config: "
+                      << config.status();
+      SetLastError(config.status());
+      return config.status();
+    }
+    return config;
+  } else {
+    auto default_conversation_config =
+        ConversationConfig::CreateDefault(*engine->engine);
+    if (!default_conversation_config.ok()) {
+      ABSL_LOG(ERROR) << "Failed to create default conversation config: "
+                      << default_conversation_config.status();
+      SetLastError(default_conversation_config.status());
+      return default_conversation_config.status();
+    }
+    return default_conversation_config;
+  }
+
+}
+}  // namespace
 
 extern "C" {
 
@@ -378,133 +511,9 @@ LiteRtLmConversation* litert_lm_conversation_create(
     return nullptr;
   }
 
-  absl::StatusOr<std::unique_ptr<Conversation>> conversation;
-  if (c_config) {
-    litert::lm::JsonPreface json_preface;
-    if (!c_config->system_message_json.empty()) {
-      nlohmann::ordered_json system_message;
-      system_message["role"] = "system";
-      auto content = nlohmann::ordered_json::parse(
-          c_config->system_message_json, nullptr, false);
-      if (content.is_discarded()) {
-        system_message["content"] = c_config->system_message_json;
-      } else {
-        system_message["content"] = content;
-      }
-      json_preface.messages = nlohmann::ordered_json::array({system_message});
-    }
-
-    if (!c_config->messages_json.empty()) {
-      auto messages = nlohmann::ordered_json::parse(c_config->messages_json,
-                                                    nullptr, false);
-      if (messages.is_discarded()) {
-        ABSL_LOG(ERROR) << "Failed to parse messages JSON.";
-      } else if (!messages.is_array()) {
-        ABSL_LOG(ERROR) << "Messages JSON is not an array.";
-      } else {
-        if (json_preface.messages.is_array()) {
-          json_preface.messages.insert(json_preface.messages.end(),
-                                       messages.begin(), messages.end());
-        } else {
-          json_preface.messages = std::move(messages);
-        }
-      }
-    }
-
-    if (!c_config->tools_json.empty()) {
-      auto tool_json_parsed =
-          nlohmann::ordered_json::parse(c_config->tools_json, nullptr, false);
-      if (!tool_json_parsed.is_discarded() && tool_json_parsed.is_array()) {
-        json_preface.tools = tool_json_parsed;
-      } else {
-        ABSL_LOG(ERROR) << "Failed to parse tools JSON or not an array: "
-                        << c_config->tools_json;
-      }
-    }
-
-    if (!c_config->extra_context_json.empty()) {
-      auto extra_context_parsed = nlohmann::ordered_json::parse(
-          c_config->extra_context_json, nullptr, false);
-      if (!extra_context_parsed.is_discarded() &&
-          extra_context_parsed.is_object()) {
-        json_preface.extra_context = std::move(extra_context_parsed);
-      } else {
-        ABSL_LOG(ERROR)
-            << "Failed to parse extra context JSON or not an object: "
-            << c_config->extra_context_json;
-      }
-    }
-
-    auto builder = litert::lm::ConversationConfig::Builder();
-    SessionConfig session_config = c_config->session_config
-                                       ? *c_config->session_config
-                                       : SessionConfig::CreateDefault();
-    if (engine->engine->GetEngineSettings()
-            .GetAudioExecutorSettings()
-            .has_value()) {
-      session_config.SetAudioModalityEnabled(true);
-    }
-    if (engine->engine->GetEngineSettings()
-            .GetVisionExecutorSettings()
-            .has_value()) {
-      session_config.SetVisionModalityEnabled(true);
-    }
-    builder.SetSessionConfig(session_config);
-
-    builder.SetPreface(json_preface);
-    builder.SetEnableConstrainedDecoding(c_config->enable_constrained_decoding);
-
-    if (c_config->constraint_provider_type.has_value() &&
-        *c_config->constraint_provider_type ==
-            kLiteRtLmConstraintProviderTypeLlGuidance) {
-      builder.SetConstraintProviderConfig(litert::lm::LlGuidanceConfig());
-    }
-
-    if (c_config->filter_channel_content_from_kv_cache.has_value()) {
-      builder.SetFilterChannelContentFromKvCache(
-          *c_config->filter_channel_content_from_kv_cache);
-    }
-    builder.SetStreamToolCalls(c_config->stream_tool_calls,
-                               c_config->stream_tool_calls_channel_name);
-    if (!c_config->prompt_template.empty()) {
-      builder.SetOverwritePromptTemplate(
-          litert::lm::PromptTemplate(c_config->prompt_template));
-    }
-    if (c_config->thinking_config.has_value()) {
-      builder.SetThinkingConfig(*c_config->thinking_config);
-    }
-    // For disabling rewinding, we don't use a config, but instead force the
-    // option if and only if GPU artisan ringbuffers are being used in the
-    // engine.
-    auto& main_settings =
-        engine->engine->GetEngineSettings().GetMainExecutorSettings();
-    auto gpu_artisan_config =
-        main_settings.GetBackendConfig<litert::lm::GpuArtisanConfig>();
-    if (gpu_artisan_config.ok() &&
-        gpu_artisan_config->use_autosized_ringbuffers) {
-      builder.SetEnableRewinding(false);
-    }
-    auto config = builder.Build(*engine->engine);
-
-    if (!config.ok()) {
-      ABSL_LOG(ERROR) << "Failed to create conversation config: "
-                      << config.status();
-      SetLastError(config.status());
-      return nullptr;
-    }
-    conversation = Conversation::Create(*engine->engine, *config);
-  } else {
-    auto default_conversation_config =
-        ConversationConfig::CreateDefault(*engine->engine);
-    if (!default_conversation_config.ok()) {
-      ABSL_LOG(ERROR) << "Failed to create default conversation config: "
-                      << default_conversation_config.status();
-      SetLastError(default_conversation_config.status());
-      return nullptr;
-    }
-    conversation =
-        Conversation::Create(*engine->engine, *default_conversation_config);
-  }
+  auto config = BuildConversationConfig(engine, c_config);
+  if (!config.ok()) return nullptr;
+  auto conversation = Conversation::Create(*engine->engine, *config);
 
   if (!conversation.ok()) {
     ABSL_LOG(ERROR) << "Failed to create conversation: "
@@ -515,6 +524,68 @@ LiteRtLmConversation* litert_lm_conversation_create(
   auto* c_conversation = new LiteRtLmConversation;
   c_conversation->conversation = *std::move(conversation);
   return c_conversation;
+}
+
+int litert_lm_engine_count_first_input_text_tokens(
+    LiteRtLmEngine* engine, const LiteRtLmConversationConfig* c_config,
+    const char* message_json, const char* extra_context,
+    const LiteRtLmConversationOptionalArgs* optional_args, size_t* out_count) {
+  if (out_count != nullptr) *out_count = 0;
+  if (engine == nullptr || engine->engine == nullptr || message_json == nullptr ||
+      extra_context == nullptr || out_count == nullptr) {
+    return static_cast<int>(absl::StatusCode::kInvalidArgument);
+  }
+  try {
+    // Copy all caller-owned configuration/options before constructing the probe.
+    // Caller serialization is required while these C handles are borrowed.
+    const auto frozen_config = c_config == nullptr
+        ? std::optional<LiteRtLmConversationConfig>()
+        : std::optional<LiteRtLmConversationConfig>(*c_config);
+    const auto frozen_options = optional_args == nullptr
+        ? std::optional<LiteRtLmConversationOptionalArgs>()
+        : std::optional<LiteRtLmConversationOptionalArgs>(*optional_args);
+    // Preserve the same sorted-object JSON -> ordered Message conversion as
+    // both existing C Send APIs; authored object ordering is not preserved there.
+    nlohmann::json message = nlohmann::json::parse(message_json, nullptr, false);
+    auto extra = nlohmann::ordered_json::parse(extra_context, nullptr, false);
+    if (message.is_discarded() || extra.is_discarded() || !extra.is_object() ||
+        !extra.contains("now") || !extra["now"].is_number_integer()) {
+      return static_cast<int>(absl::StatusCode::kInvalidArgument);
+    }
+    // Legacy create intentionally tolerates some malformed configuration JSON.
+    // Count refuses it before that builder can drop/log any authored bytes.
+    if (frozen_config.has_value()) {
+      for (const auto* field : {&frozen_config->messages_json,
+                                &frozen_config->tools_json,
+                                &frozen_config->extra_context_json}) {
+        if (field->empty()) continue;
+        const auto value = nlohmann::ordered_json::parse(*field, nullptr, false);
+        const bool object = field == &frozen_config->extra_context_json;
+        if (value.is_discarded() || (object ? !value.is_object() : !value.is_array())) {
+          return static_cast<int>(absl::StatusCode::kInvalidArgument);
+        }
+      }
+    }
+    auto config = BuildConversationConfig(
+        engine, frozen_config.has_value() ? &*frozen_config : nullptr);
+    if (!config.ok()) return static_cast<int>(config.status().code());
+    // Use precisely the same option conversion as Send, with the same resolved
+    // native configuration. No ad hoc thinking/tool/BOS implementation exists.
+    auto args = CreateOptionalArgs(*config, nullptr,
+        frozen_options.has_value() ? &*frozen_options : nullptr);
+    args.extra_context = std::move(extra);
+    auto count = Conversation::CountFirstInputTextTokens(
+        *engine->engine, *config, message, args);
+    if (!count.ok()) return static_cast<int>(count.status().code());
+    *out_count = *count;
+    return 0;
+  } catch (const nlohmann::json::exception&) {
+    return static_cast<int>(absl::StatusCode::kInvalidArgument);
+  } catch (const std::bad_alloc&) {
+    return static_cast<int>(absl::StatusCode::kResourceExhausted);
+  } catch (const std::exception&) {
+    return static_cast<int>(absl::StatusCode::kInternal);
+  }
 }
 
 void litert_lm_conversation_delete(LiteRtLmConversation* conversation) {
@@ -557,7 +628,7 @@ LiteRtLmJsonResponse* litert_lm_conversation_send_message(
   }
 
   OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
-      conversation->conversation.get(), extra_context, optional_args);
+      conversation->conversation->GetConfig(), extra_context, optional_args);
 
   auto response = conversation->conversation->SendMessage(
       json_message, std::move(litert_lm_optional_args));
@@ -603,7 +674,7 @@ int litert_lm_conversation_send_message_stream(
   }
 
   litert::lm::OptionalArgs litert_lm_optional_args = CreateOptionalArgs(
-      conversation->conversation.get(), extra_context, optional_args);
+      conversation->conversation->GetConfig(), extra_context, optional_args);
 
   absl::Status status = conversation->conversation->SendMessageAsync(
       json_message, CreateConversationCallback(callback, callback_data),

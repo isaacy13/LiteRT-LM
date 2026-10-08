@@ -14,134 +14,186 @@
 
 #include "runtime/components/constrained_decoding/llg_fc_tool_calls.h"
 
-#include <filesystem>  // NOLINT: Required for path manipulation.
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/escaping.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/bitmap.h"
 #include "runtime/components/constrained_decoding/constraint.h"
-#include "runtime/components/constrained_decoding/constraint_provider.h"
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/components/constrained_decoding/llg_constraint_provider.h"
 #include "runtime/components/constrained_decoding/llguidance_schema_utils.h"
 #include "runtime/util/status_macros.h"
 #include "runtime/util/test_utils.h"  // NOLINT
-#include "support/tokenizer/sentencepiece_tokenizer.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
-namespace {
-
-constexpr char kTestdataDir[] =
-    "litert_lm/runtime/components/testdata/";
-
-std::string GetTestdataPath(const std::string& file_name) {
-  return (std::filesystem::path(::testing::SrcDir()) / kTestdataDir / file_name)
-      .string();
-}
 
 using Tokenizer = ::litert::support::Tokenizer;
 using TokenizerType = ::litert::support::TokenizerType;
 using TokenIds = ::litert::support::TokenIds;
 
+namespace {
+
 using ::testing::status::StatusIs;
 
-class TestSentencePieceTokenizer : public Tokenizer {
+struct TokenDef {
+  std::string text;
+  int id;
+  bool is_control;
+};
+
+class SimpleTokenizer : public Tokenizer {
  public:
-  explicit TestSentencePieceTokenizer(
-      std::unique_ptr<::litert::support::SentencePieceTokenizer> tokenizer)
-      : tokenizer_(std::move(tokenizer)) {}
+  static constexpr int kPadId = 0;
+  static constexpr int kEosId = 1;
+  static constexpr int kVocabSize = 600;
+
+  SimpleTokenizer() {
+    for (int i = 0; i < 256; ++i) {
+      char c = static_cast<char>(i);
+      if (c != '<' && c != '>') {
+        vocab_[std::string(1, c)] = i;
+        id_to_piece_[i] = std::string(1, c);
+      }
+    }
+
+    const std::vector<TokenDef> token_defs = {
+        {"<pad>", kPadId, true},
+        {"<eos>", kEosId, true},
+        {"<start_function_call>", 501, true},
+        {"<end_function_call>", 502, true},
+        {"<escape>", 503, true},
+        {"<start_function_response>", 504, true},
+        {"<div>", 505, false},
+        {"</div>", 506, false},
+    };
+
+    for (const auto& def : token_defs) {
+      vocab_[def.text] = def.id;
+      id_to_piece_[def.id] = def.text;
+      if (def.is_control) {
+        control_token_texts_.insert(def.text);
+      }
+    }
+  }
 
   TokenizerType GetTokenizerType() const override {
-    return tokenizer_->GetTokenizerType();
+    return TokenizerType::kSentencePiece;
   }
 
   absl::StatusOr<TokenIds> TextToTokenIds(absl::string_view text) override {
-    return tokenizer_->TextToTokenIds(text);
+    TokenIds ids;
+    absl::string_view remaining_text = text;
+
+    while (!remaining_text.empty()) {
+      int best_match_len = 0;
+      int token_id = -1;
+
+      for (int len = remaining_text.length(); len >= 1; --len) {
+        absl::string_view prefix = remaining_text.substr(0, len);
+        auto it = vocab_.find(prefix);
+        if (it != vocab_.end()) {
+          best_match_len = len;
+          token_id = it->second;
+          break;
+        }
+      }
+
+      if (token_id != -1) {
+        ids.push_back(token_id);
+        remaining_text.remove_prefix(best_match_len);
+      } else {
+        return absl::InternalError(
+            absl::StrCat("Failed to tokenize at: ", remaining_text));
+      }
+    }
+    return ids;
   }
 
   absl::StatusOr<int> TokenToId(absl::string_view token) override {
-    return tokenizer_->TokenToId(token);
+    auto it = vocab_.find(token);
+    if (it != vocab_.end()) {
+      return it->second;
+    }
+    return absl::NotFoundError(absl::StrCat("Token not found: ", token));
   }
 
   absl::StatusOr<std::string> TokenIdsToText(
       absl::Span<const int> ids, bool skip_special_tokens) override {
-    return tokenizer_->TokenIdsToText(ids);
+    std::string text;
+    for (int id : ids) {
+      auto it = id_to_piece_.find(id);
+      if (it != id_to_piece_.end()) {
+        text += it->second;
+      } else {
+        return absl::InternalError(absl::StrCat("Unknown token ID: ", id));
+      }
+    }
+    return text;
   }
 
   std::vector<std::string> GetTokens() const override {
-    return tokenizer_->GetTokens();
+    std::vector<std::string> tokens(kVocabSize);
+    for (int i = 0; i < tokens.size(); ++i) {
+      tokens[i] = "[UNUSED_" + std::to_string(i) + "]";
+    }
+
+    for (const auto& pair : id_to_piece_) {
+      int id = pair.first;
+      if (id >= 0 && id < kVocabSize) {
+        const std::string& token_str = pair.second;
+        if (control_token_texts_.count(token_str)) {
+          tokens[id] = "\xff" + token_str;
+        } else {
+          tokens[id] = token_str;
+        }
+      }
+    }
+    return tokens;
   }
 
-  int GetVocabSize() const override { return tokenizer_->GetVocabSize(); }
-
-  const ::litert::support::SentencePieceTokenizer& GetInternalTokenizer()
-      const {
-    return *tokenizer_;
-  }
+  int GetVocabSize() const override { return kVocabSize; }
 
  private:
-  std::unique_ptr<::litert::support::SentencePieceTokenizer> tokenizer_;
+  absl::flat_hash_map<std::string, int> vocab_;
+  absl::flat_hash_map<int, std::string> id_to_piece_;
+  std::set<std::string> control_token_texts_;
 };
 
 class LlgFcToolCallsTest : public testing::Test {
  protected:
-  static void SetUpTestSuite() {
-    ASSERT_OK_AND_ASSIGN(
-        auto tokenizer,
-        ::litert::support::SentencePieceTokenizer::CreateFromFile(
-            GetTestdataPath("gemma4_sentencepiece.model")));
-    tokenizer_ = new TestSentencePieceTokenizer(std::move(tokenizer));
-    ASSERT_OK_AND_ASSIGN(
-        auto provider, LlgConstraintProvider::Create(*tokenizer_, GetConfig()));
-    provider_ = provider.release();
-  }
-
-  static void TearDownTestSuite() {
-    delete provider_;
-    provider_ = nullptr;
-    delete tokenizer_;
-    tokenizer_ = nullptr;
-  }
-
-  static const LlGuidanceConfig& GetConfig() {
-    static const auto* const config = new LlGuidanceConfig{
-        .eos_id = 1,
-        .special_tokens = {"<|tool_call>", "<tool_call|>", "<|tool_response>",
-                           "<tool_response|>", "<|\"|>"}};
-    return *config;
-  }
-  static inline TestSentencePieceTokenizer* tokenizer_ = nullptr;
-  static inline ConstraintProvider* provider_ = nullptr;
+  SimpleTokenizer tokenizer_;
+  LlGuidanceConfig config_{.eos_id = 1};
 
   LlgConstraintsOptions GetDefaultFcOptions(LlgConstraintMode mode) {
     LlgConstraintsOptions options;
     options.funcall_format = FuncallFormat::kFc;
     options.constraint_mode = mode;
-
-    // Gemma 4 token expectations:
-    options.code_fence_start = "<|tool_call>";
-    options.code_fence_end = "<tool_call|>";
-    options.function_response_start = "<|tool_response>";
-    options.open_quote = "<|\"|>";
-    options.close_quote = "<|\"|>";
-
+    options.code_fence_start = "<start_function_call>";
+    options.code_fence_end = "<end_function_call>";
+    options.function_response_start = "<start_function_response>";
+    options.open_quote = "<escape>";
+    options.close_quote = "<escape>";
     return options;
   }
 
   absl::StatusOr<bool> AcceptsInternal(Constraint& constraint,
                                        absl::string_view text) {
-    ABSL_ASSIGN_OR_RETURN(TokenIds ids, tokenizer_->TextToTokenIds(text));
+    ABSL_ASSIGN_OR_RETURN(TokenIds ids, tokenizer_.TextToTokenIds(text));
     auto state = constraint.Start();
     for (int i = 0; i < ids.size(); ++i) {
       int id = ids[i];
@@ -153,26 +205,26 @@ class LlgFcToolCallsTest : public testing::Test {
       ABSL_ASSIGN_OR_RETURN(state, constraint.ComputeNext(*state, id));
     }
     ABSL_ASSIGN_OR_RETURN(auto final_bitmap, constraint.ComputeBitmap(*state));
-    return final_bitmap->Get(*GetConfig().eos_id);
+    return final_bitmap->Get(*config_.eos_id);
   }
 
   void AssertAccepts(Constraint& constraint, absl::string_view text) {
-    auto accepts = AcceptsInternal(constraint, text);
-    if (!accepts.ok()) {
+    auto accepts_or = AcceptsInternal(constraint, text);
+    if (!accepts_or.ok()) {
       ADD_FAILURE() << "AcceptsInternal failed for text: \"" << text
-                    << "\"\nStatus: " << accepts.status();
+                    << "\"\nStatus: " << accepts_or.status();
       return;
     }
-    if (!*accepts) {
+    if (!*accepts_or) {
       ADD_FAILURE() << "Constraint failed to ACCEPT text: \""
                     << absl::Utf8SafeCEscape(text) << "\"";
     }
   }
 
   void AssertRejects(Constraint& constraint, absl::string_view text) {
-    auto accepts = AcceptsInternal(constraint, text);
-    if (!accepts.ok() || !*accepts) return;
-    if (*accepts) {
+    auto accepts_or = AcceptsInternal(constraint, text);
+    if (!accepts_or.ok() || !*accepts_or) return;
+    if (*accepts_or) {
       ADD_FAILURE() << "Constraint failed to REJECT text: \""
                     << absl::Utf8SafeCEscape(text) << "\"";
     }
@@ -181,23 +233,28 @@ class LlgFcToolCallsTest : public testing::Test {
   std::unique_ptr<Constraint> CreateConstraint(
       const nlohmann::ordered_json& tools,
       const LlgConstraintsOptions& options) {
-    if (!provider_) {
-      ADD_FAILURE() << "Constraint provider is not initialized.";
+    auto provider_status_or =
+        LlgConstraintProvider::Create(tokenizer_, config_);
+    if (!provider_status_or.ok()) {
+      ADD_FAILURE() << "Failed to create provider: "
+                    << provider_status_or.status();
       return nullptr;
     }
+    auto provider = std::move(*provider_status_or);
 
     auto res = CreateLarkGrammarForFcToolCalls(tools, options);
     EXPECT_OK(res);
     if (!res.ok()) return nullptr;
 
-    auto constraint = provider_->CreateConstraint(
+    auto constraint_status_or = provider->CreateConstraint(
         LlGuidanceConstraintArg{.constraint_type = LlgConstraintType::kLark,
                                 .constraint_string = *res});
-    if (!constraint.ok()) {
-      ADD_FAILURE() << "Failed to create constraint: " << constraint.status();
+    if (!constraint_status_or.ok()) {
+      ADD_FAILURE() << "Failed to create constraint: "
+                    << constraint_status_or.status();
       return nullptr;
     }
-    return std::move(*constraint);
+    return std::move(*constraint_status_or);
   }
 };
 
@@ -212,8 +269,9 @@ TEST_F(LlgFcToolCallsTest, TextOnly) {
 
   AssertAccepts(*constraint, "This is just plain text.");
   AssertAccepts(*constraint, "Some html tags <div>some text</div>");
-  AssertRejects(*constraint,
-                "Something <|tool_call>call:get_weather{}<tool_call|>");
+  AssertRejects(
+      *constraint,
+      "Something <start_function_call>call:get_weather{}<end_function_call>");
 }
 
 TEST_F(LlgFcToolCallsTest, TextAndOrFunctionCalls) {
@@ -257,31 +315,32 @@ TEST_F(LlgFcToolCallsTest, TextAndOrFunctionCalls) {
   // Single function call.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call><start_function_response>)");
   // Single function call with text before.
   AssertAccepts(
       *constraint,
-      R"(Some normal text<|tool_call>call:find_movies{genres:[<|"|>Action<|"|>]}<tool_call|><|tool_response>)");
+      R"(Some normal text<start_function_call>call:find_movies{genres:[<escape>Action<escape>]}<end_function_call><start_function_response>)");
   // Multiple function calls.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>}<tool_call|><|tool_call>call:find_movies{genres:[<|"|>Action<|"|>]}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>}<end_function_call><start_function_call>call:find_movies{genres:[<escape>Action<escape>]}<end_function_call><start_function_response>)");
   // Multiple function calls with text before.
   AssertAccepts(
       *constraint,
-      R"(Some normal text ... <|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|><|tool_call>call:find_movies{genres:[<|"|>Action<|"|>,<|"|>Comedy<|"|>]}<tool_call|><|tool_response>)");
+      R"(Some normal text ... <start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call><start_function_call>call:find_movies{genres:[<escape>Action<escape>,<escape>Comedy<escape>]}<end_function_call><start_function_response>)");
 
-  // Rejects function call without <|tool_response> suffix.
+  // Rejects function call without <start_function_response> suffix.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call>)");
   // Rejects function call with wrong function name.
-  AssertRejects(*constraint,
-                R"(<|tool_call>call:get_weath{}<tool_call|><|tool_response>)");
+  AssertRejects(
+      *constraint,
+      R"(<start_function_call>call:get_weath{}<end_function_call><start_function_response>)");
   // Rejects function call with extra text after it.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{}<tool_call|><|tool_response>extra text)");
+      R"(<start_function_call>call:get_weather{}<end_function_call><start_function_response>extra text)");
 }
 
 TEST_F(LlgFcToolCallsTest, FunctionCallsOnly) {
@@ -342,36 +401,38 @@ TEST_F(LlgFcToolCallsTest, FunctionCallsOnly) {
   // Single function call.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call><start_function_response>)");
   // Single function call without params.
-  AssertAccepts(*constraint,
-                R"(<|tool_call>call:get_time{}<tool_call|><|tool_response>)");
+  AssertAccepts(
+      *constraint,
+      R"(<start_function_call>call:get_time{}<end_function_call><start_function_response>)");
   // Multiple function calls with different primitive parameters.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:find_movies{genres:[<|"|>Action<|"|>]}<tool_call|><|tool_call>call:set_timer{duration:10,sound:true}<tool_call|><|tool_call>call:set_timer{duration:5,sound:false}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:find_movies{genres:[<escape>Action<escape>]}<end_function_call><start_function_call>call:set_timer{duration:10,sound:true}<end_function_call><start_function_call>call:set_timer{duration:5,sound:false}<end_function_call><start_function_response>)");
 
   // Rejects Text only
   AssertRejects(*constraint, "A normal text");
   // Rejects single function call with text before
   AssertRejects(
       *constraint,
-      R"(Some normal text<|tool_call>call:find_movies{genres:[<|"|>Action<|"|>,<|"|>Comedy<|"|>]}<tool_call|><|tool_response>)");
+      R"(Some normal text<start_function_call>call:find_movies{genres:[<escape>Action<escape>,<escape>Comedy<escape>]}<end_function_call><start_function_response>)");
   // Rejects multiple function calls with text before.
   AssertRejects(
       *constraint,
-      R"(Some normal text <|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|><|tool_call>call:find_movies{genres:[<|"|>Action<|"|>,<|"|>Comedy<|"|>]}<tool_call|><|tool_response>)");
-  // Rejects function call without <|tool_response> suffix.
+      R"(Some normal text <start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call><start_function_call>call:find_movies{genres:[<escape>Action<escape>,<escape>Comedy<escape>]}<end_function_call><start_function_response>)");
+  // Rejects function call without <start_function_response> suffix.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call>)");
   // Rejects function call with wrong function name.
-  AssertRejects(*constraint,
-                R"(<|tool_call>call:get_weath{}<tool_call|><|tool_response>)");
+  AssertRejects(
+      *constraint,
+      R"(<start_function_call>call:get_weath{}<end_function_call><start_function_response>)");
   // Rejects function call with extra text after it.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{}<tool_call|><|tool_response>extra text)");
+      R"(<start_function_call>call:get_weather{}<end_function_call><start_function_response>extra text)");
 }
 
 TEST_F(LlgFcToolCallsTest, EmptyTools_TextOnly_Lark) {
@@ -379,8 +440,9 @@ TEST_F(LlgFcToolCallsTest, EmptyTools_TextOnly_Lark) {
   auto constraint = CreateConstraint(
       tools, GetDefaultFcOptions(LlgConstraintMode::kTextOnly));
   AssertAccepts(*constraint, "Any text is fine.");
-  AssertRejects(*constraint,
-                "Text with <|tool_call>call:some_tool{}<tool_call|>");
+  AssertRejects(
+      *constraint,
+      "Text with <start_function_call>call:some_tool{}<end_function_call>");
 }
 
 TEST_F(LlgFcToolCallsTest, EmptyTools_TextAndOrFunctionCalls_Lark) {
@@ -388,8 +450,9 @@ TEST_F(LlgFcToolCallsTest, EmptyTools_TextAndOrFunctionCalls_Lark) {
   auto constraint = CreateConstraint(
       tools, GetDefaultFcOptions(LlgConstraintMode::kTextAndOrFunctionCalls));
   AssertAccepts(*constraint, "Any text is fine.");
-  AssertRejects(*constraint,
-                "Text with <|tool_call>call:some_tool{}<tool_call|>");
+  AssertRejects(
+      *constraint,
+      "Text with <start_function_call>call:some_tool{}<end_function_call>");
 }
 
 TEST_F(LlgFcToolCallsTest, EmptyTools_FunctionCallsOnly_Lark) {
@@ -424,15 +487,15 @@ TEST_F(LlgFcToolCallsTest, ParameterNameConstraint) {
   // Accept valid parameters.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,unit:<|"|>celsius<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,unit:<escape>celsius<escape>}<end_function_call><start_function_response>)");
 
   // Reject unexpected parameter name.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>,extra:<|"|>data<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>,extra:<escape>data<escape>}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, NoParameters) {
@@ -445,13 +508,14 @@ TEST_F(LlgFcToolCallsTest, NoParameters) {
       tools, GetDefaultFcOptions(LlgConstraintMode::kFunctionCallsOnly));
 
   // Accept valid call.
-  AssertAccepts(*constraint,
-                R"(<|tool_call>call:get_time{}<tool_call|><|tool_response>)");
+  AssertAccepts(
+      *constraint,
+      R"(<start_function_call>call:get_time{}<end_function_call><start_function_response>)");
 
   // Reject call with unexpected parameters.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_time{timezone:<|"|>PST<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_time{timezone:<escape>PST<escape>}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, RequiredParameter) {
@@ -475,12 +539,12 @@ TEST_F(LlgFcToolCallsTest, RequiredParameter) {
   // Accept with required parameter.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>}<end_function_call><start_function_response>)");
 
   // Reject missing required parameter.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, OptionalParameter) {
@@ -498,13 +562,14 @@ TEST_F(LlgFcToolCallsTest, OptionalParameter) {
       tools, GetDefaultFcOptions(LlgConstraintMode::kFunctionCallsOnly));
 
   // Valid without optional parameter.
-  AssertAccepts(*constraint,
-                R"(<|tool_call>call:ping{}<tool_call|><|tool_response>)");
+  AssertAccepts(
+      *constraint,
+      R"(<start_function_call>call:ping{}<end_function_call><start_function_response>)");
 
   // Valid with optional parameter.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:ping{timeout:5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:ping{timeout:5}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, RequiredAndOptionalParameters) {
@@ -530,17 +595,17 @@ TEST_F(LlgFcToolCallsTest, RequiredAndOptionalParameters) {
   // Accept with required parameter and optional parameter.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10,sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10,sound:true}<end_function_call><start_function_response>)");
 
   // Accept with required parameter only.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10}<end_function_call><start_function_response>)");
 
   // Reject with optional parameter only.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{sound:true}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, PrimitiveTypes) {
@@ -567,18 +632,24 @@ TEST_F(LlgFcToolCallsTest, PrimitiveTypes) {
   // Accept valid types.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10}<end_function_call><start_function_response>)");
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10,sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10,sound:true}<end_function_call><start_function_response>)");
 
   // Reject invalid type (string instead of integer).
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:<|"|>10<|"|>,sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:<escape>10<escape>,sound:true}<end_function_call><start_function_response>)");
 
   // Reject invalid type (string instead of boolean).
+  AssertRejects(
+      *constraint,
+
+      R"(<start_function_call>call:set_timer{duration:10,sound:<escape>true<escape>}<end_function_call><start_function_response>)");
+
+  // A different wire format cannot satisfy this fixture's configured fences.
   AssertRejects(
       *constraint,
       R"(<|tool_call>call:set_timer{duration:10,sound:<|"|>true<|"|>}<tool_call|><|tool_response>)");
@@ -586,23 +657,23 @@ TEST_F(LlgFcToolCallsTest, PrimitiveTypes) {
   // Accept other well-formed integers.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:0}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:0}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:-5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:-5}<end_function_call><start_function_response>)");
 
   // Reject floats. "integer" and "number" are distinct JSON Schema types, so
   // a fraction or an exponent must not be permitted here. Consumers that
   // decode into a fixed-width integer reject 10.0 outright.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10.5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10.5}<end_function_call><start_function_response>)");
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10.0}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10.0}<end_function_call><start_function_response>)");
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:1e3}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:1e3}<end_function_call><start_function_response>)");
 }
 
 // Guards the other direction: tightening "integer" must not also tighten
@@ -627,13 +698,13 @@ TEST_F(LlgFcToolCallsTest, NumberParametersStillAcceptFloats) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:21.5}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:21.5}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:21}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:21}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_temperature{celsius:2.15e1}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_temperature{celsius:2.15e1}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, EnumParameters) {
@@ -661,12 +732,12 @@ TEST_F(LlgFcToolCallsTest, EnumParameters) {
   // Accept valid enum value.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_device_state{device:<|"|>light<|"|>,state:<|"|>on<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_device_state{device:<escape>light<escape>,state:<escape>on<escape>}<end_function_call><start_function_response>)");
 
   // Reject invalid enum value.
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_device_state{device:<|"|>light<|"|>,state:<|"|>dimmed<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_device_state{device:<escape>light<escape>,state:<escape>dimmed<escape>}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, FcArgumentTypes) {
@@ -694,7 +765,7 @@ TEST_F(LlgFcToolCallsTest, FcArgumentTypes) {
   // Accepts all supported types.
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:complex_tool{str:<|"|>abc<|"|>,num:1.2,int:3,bool:true,list:[<|"|>a<|"|>,<|"|>b<|"|>],dict:{k:<|"|>v<|"|>},null_val:null}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:complex_tool{str:<escape>abc<escape>,num:1.2,int:3,bool:true,list:[<escape>a<escape>,<escape>b<escape>],dict:{k:<escape>v<escape>},null_val:null}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, FcNullValue) {
@@ -716,7 +787,7 @@ TEST_F(LlgFcToolCallsTest, FcNullValue) {
 
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>MV<|"|>,unit:null}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>MV<escape>,unit:null}<end_function_call><start_function_response>)");
 
   nlohmann::ordered_json tool2 = nlohmann::ordered_json::parse(R"json({
     "name": "get_weather",
@@ -735,7 +806,7 @@ TEST_F(LlgFcToolCallsTest, FcNullValue) {
 
   AssertAccepts(
       *constraint2,
-      R"(<|tool_call>call:get_weather{location:<|"|>MV<|"|>,unit:null}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>MV<escape>,unit:null}<end_function_call><start_function_response>)");
 
   nlohmann::ordered_json tool3 = nlohmann::ordered_json::parse(R"json({
     "name": "get_weather",
@@ -753,10 +824,10 @@ TEST_F(LlgFcToolCallsTest, FcNullValue) {
 
   AssertAccepts(
       *constraint3,
-      R"(<|tool_call>call:get_weather{location:null}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:null}<end_function_call><start_function_response>)");
   AssertRejects(
       *constraint3,
-      R"(<|tool_call>call:get_weather{}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, FcNestedStructures) {
@@ -786,7 +857,7 @@ TEST_F(LlgFcToolCallsTest, FcNestedStructures) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:nested_tool{nested_arr:[[1,2],[3]],nested_obj:{a:{b:<|"|>c<|"|>}}}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:nested_tool{nested_arr:[[1,2],[3]],nested_obj:{a:{b:<escape>c<escape>}}}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, RequiredParametersStrictOrder) {
@@ -812,11 +883,11 @@ TEST_F(LlgFcToolCallsTest, RequiredParametersStrictOrder) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{sound:true,duration:10}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{sound:true,duration:10}<end_function_call><start_function_response>)");
 
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10,sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10,sound:true}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, RequiredParametersBeforeOptional) {
@@ -842,11 +913,11 @@ TEST_F(LlgFcToolCallsTest, RequiredParametersBeforeOptional) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:set_timer{duration:10,sound:true}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{duration:10,sound:true}<end_function_call><start_function_response>)");
 
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:set_timer{sound:true,duration:10}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:set_timer{sound:true,duration:10}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, OptionalParametersFlexibleOrder) {
@@ -866,10 +937,10 @@ TEST_F(LlgFcToolCallsTest, OptionalParametersFlexibleOrder) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:search{query:<|"|>cat<|"|>,filter:<|"|>images<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:search{query:<escape>cat<escape>,filter:<escape>images<escape>}<end_function_call><start_function_response>)");
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:search{filter:<|"|>images<|"|>,query:<|"|>cat<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:search{filter:<escape>images<escape>,query:<escape>cat<escape>}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, DuplicateOptionalParametersAllowed) {
@@ -890,15 +961,15 @@ TEST_F(LlgFcToolCallsTest, DuplicateOptionalParametersAllowed) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:search{query:<|"|>cat<|"|>,filter:<|"|>images<|"|>,filter:<|"|>videos<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:search{query:<escape>cat<escape>,filter:<escape>images<escape>,filter:<escape>videos<escape>}<end_function_call><start_function_response>)");
 
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:search{query:<|"|>cat<|"|>,query:<|"|>dog<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:search{query:<escape>cat<escape>,query:<escape>dog<escape>}<end_function_call><start_function_response>)");
 
   AssertRejects(
       *constraint,
-      R"(<|tool_call>call:search{filter:<|"|>images<|"|>,query:<|"|>cat<|"|>}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:search{filter:<escape>images<escape>,query:<escape>cat<escape>}<end_function_call><start_function_response>)");
 }
 
 TEST_F(LlgFcToolCallsTest, MultipleFunctionCalls) {
@@ -924,96 +995,11 @@ TEST_F(LlgFcToolCallsTest, MultipleFunctionCalls) {
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_weather{location:<|"|>Mountain View<|"|>}<tool_call|><|tool_call>call:get_time{}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_weather{location:<escape>Mountain View<escape>}<end_function_call><start_function_call>call:get_time{}<end_function_call><start_function_response>)");
 
   AssertAccepts(
       *constraint,
-      R"(<|tool_call>call:get_time{}<tool_call|><|tool_call>call:get_time{}<tool_call|><|tool_response>)");
-}
-
-TEST_F(LlgFcToolCallsTest, OneOfPropertyConstraint) {
-  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
-    "name": "selection",
-    "description": "Select an element",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "bounds": {
-          "one_of": [
-            { "type": "string" },
-            { "type": "number" }
-          ]
-        }
-      },
-      "required": ["bounds"]
-    }
-  })json");
-  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
-
-  auto constraint = CreateConstraint(
-      tools, GetDefaultFcOptions(LlgConstraintMode::kFunctionCallsOnly));
-
-  AssertAccepts(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:<|"|>top_left<|"|>}<tool_call|><|tool_response>)");
-  AssertAccepts(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:42}<tool_call|><|tool_response>)");
-  AssertRejects(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:true}<tool_call|><|tool_response>)");
-}
-
-TEST_F(LlgFcToolCallsTest, OneOfCamelCasePropertyConstraint) {
-  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
-    "name": "selection",
-    "description": "Select an element",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "bounds": {
-          "oneOf": [
-            { "type": "string" },
-            { "type": "number" }
-          ]
-        }
-      },
-      "required": ["bounds"]
-    }
-  })json");
-  nlohmann::ordered_json tools = nlohmann::ordered_json::array({tool});
-
-  auto constraint = CreateConstraint(
-      tools, GetDefaultFcOptions(LlgConstraintMode::kFunctionCallsOnly));
-
-  AssertAccepts(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:<|"|>top_left<|"|>}<tool_call|><|tool_response>)");
-  AssertAccepts(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:42}<tool_call|><|tool_response>)");
-  AssertRejects(
-      *constraint,
-      R"(<|tool_call>call:selection{bounds:true}<tool_call|><|tool_response>)");
-}
-
-TEST_F(LlgFcToolCallsTest, OneOfToolsObjectWrapper) {
-  nlohmann::ordered_json tool = nlohmann::ordered_json::parse(R"json({
-    "name": "get_time"
-  })json");
-  nlohmann::ordered_json tools_obj = nlohmann::ordered_json::parse(R"json({
-    "oneOf": [
-      {
-        "name": "get_time"
-      }
-    ]
-  })json");
-
-  auto constraint = CreateConstraint(
-      tools_obj, GetDefaultFcOptions(LlgConstraintMode::kFunctionCallsOnly));
-
-  AssertAccepts(*constraint,
-                R"(<|tool_call>call:get_time{}<tool_call|><|tool_response>)");
+      R"(<start_function_call>call:get_time{}<end_function_call><start_function_call>call:get_time{}<end_function_call><start_function_response>)");
 }
 
 }  // namespace

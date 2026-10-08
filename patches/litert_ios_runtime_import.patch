@@ -1,0 +1,40 @@
+--- a/litert/c/BUILD
++++ b/litert/c/BUILD
+@@ -1059,8 +1059,36 @@
+     }),
+ )
+ 
++# LiteRT-LM already supplies device and simulator runtimes at its pinned revision.
++# A macos_dylib target changes Apple platform and cannot serve an iOS consumer.
++config_setting(
++    name = "litert_lm_ios_device_arm64",
++    values = {"apple_platform_type": "ios", "cpu": "ios_arm64"},
++)
++
++config_setting(
++    name = "litert_lm_ios_simulator_arm64",
++    values = {"apple_platform_type": "ios", "cpu": "ios_sim_arm64"},
++)
++
++filegroup(
++    name = "litert_lm_ios_runtime",
++    srcs = select({
++        ":litert_lm_ios_device_arm64": ["@litert_lm//prebuilt/ios_arm64:libLiteRt.dylib"],
++        ":litert_lm_ios_simulator_arm64": ["@litert_lm//prebuilt/ios_sim_arm64:libLiteRt.dylib"],
++    }),
++)
++
++filegroup(
++    name = "litert_lm_ios_runtime_conditional",
++    srcs = select({
++        ":resolve_symbols_in_exec": [],
++        "//conditions:default": [":litert_lm_ios_runtime"],
++    }),
++)
++
+ SELECT_LITERT_RUNTIME_C_API_SHARED_LIB = select({
+-    "//litert:ios": [":litert_runtime_c_api_dylib_conditional"],
++    "//litert:ios": [":litert_lm_ios_runtime_conditional"],
+     "//litert:macos": [":litert_runtime_c_api_dylib_conditional"],
+     "//litert:windows": [],
+     "//conditions:default": [":litert_runtime_c_api_so_conditional"],

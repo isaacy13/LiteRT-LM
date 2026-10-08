@@ -166,6 +166,26 @@ target_link_libraries(runtime_components_constrained_decoding_constraint_provide
 )
 
 # ==============================================================================
+# Constraint Provider Cache
+# ==============================================================================
+add_litertlm_library(runtime_components_constrained_decoding_constraint_provider_cache STATIC
+  constraint_provider_cache.cc
+)
+add_library(LiteRTLM::Runtime::Components::ConstrainedDecoding::ProviderCache
+  ALIAS runtime_components_constrained_decoding_constraint_provider_cache)
+
+target_include_directories(runtime_components_constrained_decoding_constraint_provider_cache
+  PUBLIC ${LITERTLM_INCLUDE_PATHS}
+)
+
+target_link_libraries(runtime_components_constrained_decoding_constraint_provider_cache
+  PUBLIC
+    LiteRTLM::Runtime::Components::ConstrainedDecoding::Factory
+    LiteRTLM::Runtime::Components::TokenizerInterface
+    LITERTLM_DEPS
+)
+
+# ==============================================================================
 # External Constraint Provider
 # ==============================================================================
 add_litertlm_library(runtime_components_constrained_decoding_external_constraint_provider STATIC

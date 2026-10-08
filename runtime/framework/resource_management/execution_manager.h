@@ -29,6 +29,8 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/constrained_decoding/constraint.h"
 #include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
@@ -80,6 +82,11 @@ struct TaskInfo {
   SessionId session_id;
   absl::AnyInvocable<void()> task;
   TaskState task_state = TaskState::kUnknown;
+  // Accepted terminal callbacks keep an active kLastCallbackQueued return
+  // fence. Their known final state already governs new dependencies while the
+  // sole callback owner is returning; Done permits normal continuations.
+  // Cleared only at terminal publication after callback return.
+  std::optional<TaskState> completion_state_after_callback = std::nullopt;
   absl::flat_hash_set<TaskId> dependent_tasks = {};
   absl::flat_hash_set<TaskId> following_tasks = {};
   std::shared_ptr<std::atomic<bool>> cancelled = nullptr;
@@ -92,6 +99,13 @@ struct TaskInfo {
 // and sessions.
 class ExecutionManager {
  public:
+  // Per-manager allocation policy for decoded IDs used by external sampling.
+  // Called on the execution owner; returned buffers transfer ownership to tasks.
+  using DecodeInputBufferFactory = absl::AnyInvocable<
+      absl::StatusOr<::litert::TensorBuffer>(absl::Span<const int>) const>;
+  static absl::StatusOr<::litert::TensorBuffer> AllocateDecodeInputBuffer(
+      absl::Span<const int> decoded_ids);
+
   virtual ~ExecutionManager() = default;
 
   // Waits until the task is done or the timeout is reached.
@@ -283,6 +297,14 @@ class ExecutionManager {
   // Returns the vision executor properties.
   virtual absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
       const = 0;
+
+ protected:
+  explicit ExecutionManager(DecodeInputBufferFactory buffer_factory = nullptr);
+  absl::StatusOr<::litert::TensorBuffer> CreateDecodeInputBuffer(
+      absl::Span<const int> decoded_ids) const;
+
+ private:
+  DecodeInputBufferFactory decode_input_buffer_factory_;
 };
 
 }  // namespace litert::lm

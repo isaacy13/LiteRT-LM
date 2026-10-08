@@ -31,6 +31,7 @@
 #include "runtime/components/model_resources.h"
 #include "runtime/core/audio_session_advanced.h"
 #include "runtime/core/session_advanced.h"
+#include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -107,6 +108,7 @@ class EngineAdvancedImpl : public Engine {
     }
 
     execution_manager_.reset();
+    ClearConstraintProviderCache();
     owned_env_.reset();
     tokenizer_.reset();
     litert_model_resources_.reset();
@@ -140,10 +142,11 @@ class EngineAdvancedImpl : public Engine {
           BenchmarkInfo::InitPhase::kSession));
     }
 
-    SessionConfig config = session_config;
-    // TODO(b/418794726): Move this logics to be part of the SessionConfig
-    // class.
-    ABSL_RETURN_IF_ERROR(config.MaybeUpdateAndValidate(engine_settings_));
+    // Shared with the canonical first-input census; no executor setup occurs
+    // during this pure settings-based resolution.
+    ABSL_ASSIGN_OR_RETURN(
+        SessionConfig config,
+        ResolveSessionConfigForCreation(session_config, engine_settings_));
 
     if (litert_model_resources_ == nullptr) {
       return absl::FailedPreconditionError(

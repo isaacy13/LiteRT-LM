@@ -66,7 +66,8 @@ std::vector<bool> SampleMaskToVector(const uint32_t* sample_mask,
 std::unique_ptr<Constraint::State> LlgConstraint::Start() const {
   ::LlgConstraint* llg_constraint =
       llg_clone_constraint(llg_constraint_owner_.llg_constraint());
-  return std::make_unique<LlgConstraint::LlgState>(llg_constraint);
+  return std::make_unique<LlgConstraint::LlgState>(
+      llg_constraint, llg_constraint_owner_.tokenization_context());
 }
 
 bool LlgConstraint::IsEnded(const LlgConstraint::State& state) const {
@@ -80,14 +81,23 @@ absl::StatusOr<std::unique_ptr<Constraint::State>> LlgConstraint::ComputeNext(
     const Constraint::State& state, int token) const {
   const auto& llg_state = static_cast<const LlgConstraint::LlgState&>(state);
 
+  // Speculative verification retains every draft position and may resume from
+  // an earlier accepted prefix. Advancing one position must not mutate another.
+  auto* cloned = llg_clone_constraint(llg_state.llg_constraint());
+  if (cloned == nullptr) {
+    return absl::InternalError("Failed to clone LLGuidance constraint state.");
+  }
+  auto next_state = std::make_unique<LlgConstraint::LlgState>(
+      cloned, llg_state.tokenization_context());
+
   LlgCommitResult commit_res;
-  if (llg_commit_token(llg_state.llg_constraint(), token, &commit_res) != 0) {
-    std::string error_message = llg_get_error(llg_state.llg_constraint());
+  if (llg_commit_token(next_state->llg_constraint(), token, &commit_res) != 0) {
+    std::string error_message = llg_get_error(next_state->llg_constraint());
     return absl::InternalError(
         absl::StrCat("Failed to commit token: ", error_message));
   }
 
-  return std::make_unique<LlgConstraint::LlgState>(llg_state);
+  return next_state;
 }
 
 absl::StatusOr<std::unique_ptr<LogitMask>> LlgConstraint::ComputeMask(

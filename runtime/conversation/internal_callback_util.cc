@@ -37,6 +37,29 @@
 namespace litert::lm {
 namespace {
 
+// The C bridge treats every error as a final packet. A processing parse error
+// must therefore wait for task termination, and no packet may follow a final.
+struct StreamCallbackState {
+  absl::AnyInvocable<void(absl::StatusOr<Message>)> callback;
+  absl::Status first_error = absl::OkStatus();
+  bool task_ended = false;
+  bool finished = false;
+
+  void Send(absl::StatusOr<Message> message) {
+    if (finished) return;
+    if (!message.ok() && first_error.ok()) first_error = message.status();
+    if (!first_error.ok()) {
+      if (task_ended) {
+        finished = true;
+        callback(first_error);
+      }
+      return;
+    }
+    if (message->empty()) finished = true;
+    callback(std::move(message));
+  }
+};
+
 // Returns the number of overlapping characters between the suffix of string
 // `a` and the prefix of string `b`.
 size_t SuffixPrefixOverlap(absl::string_view a, absl::string_view b) {
@@ -274,7 +297,7 @@ absl::AnyInvocable<void(absl::StatusOr<Responses>)> CreateInternalCallback(
   }
 
   return [&model_data_processor, processor_args,
-          user_callback = std::move(user_callback),
+          callback_state = StreamCallbackState{std::move(user_callback)},
           cancel_callback = std::move(cancel_callback),
           complete_message_callback = std::move(complete_message_callback),
           accumulated_response_text = std::string(), cursor = size_t(0),
@@ -289,21 +312,34 @@ absl::AnyInvocable<void(absl::StatusOr<Responses>)> CreateInternalCallback(
           tool_call_channel_name = std::string(tool_call_channel_name),
           tool_call_stream_cursor =
               size_t(0)](absl::StatusOr<Responses> responses) mutable {
+    if (callback_state.finished) return;
+    const TaskState task_state =
+        responses.ok() ? responses->GetTaskState() : TaskState::kUnknown;
+    callback_state.task_ended = !responses.ok() || IsTaskEndState(task_state);
+    const bool cancels_history =
+        (!responses.ok() && absl::IsCancelled(responses.status())) ||
+        task_state == TaskState::kCancelled ||
+        task_state == TaskState::kDependentTaskCancelled ||
+        (task_state == TaskState::kMaxNumTokensReached &&
+         return_error_on_max_tokens_reached);
+    if (cancels_history && cancel_callback) cancel_callback();
+
+    absl::AnyInvocable<void(absl::StatusOr<Message>)> user_callback =
+        [&callback_state](absl::StatusOr<Message> message) {
+          callback_state.Send(std::move(message));
+        };
+    if (!callback_state.first_error.ok()) {
+      if (callback_state.task_ended) user_callback(callback_state.first_error);
+      return;
+    }
+
     if (!responses.ok()) {
-      // If the error is due to cancellation, then we should trigger the cancel
-      // callback for removing the last message from the history.
-      if (cancel_callback && absl::IsCancelled(responses.status())) {
-        cancel_callback();
-      }
       user_callback(responses.status());
       return;
     }
 
     if (responses->GetTaskState() == TaskState::kCancelled ||
         responses->GetTaskState() == TaskState::kDependentTaskCancelled) {
-      if (cancel_callback) {
-        cancel_callback();
-      }
       user_callback(absl::CancelledError("Task cancelled"));
       return;
     }
@@ -318,9 +354,6 @@ absl::AnyInvocable<void(absl::StatusOr<Responses>)> CreateInternalCallback(
 
     if (responses->GetTaskState() == TaskState::kMaxNumTokensReached) {
       if (return_error_on_max_tokens_reached) {
-        if (cancel_callback) {
-          cancel_callback();
-        }
         user_callback(absl::ResourceExhaustedError(
             "Max number of tokens reached, context window out of bounds"));
         return;
@@ -333,9 +366,15 @@ absl::AnyInvocable<void(absl::StatusOr<Responses>)> CreateInternalCallback(
     if (responses->GetTaskState() == TaskState::kDone ||
         (!return_error_on_max_tokens_reached &&
          responses->GetTaskState() == TaskState::kMaxNumTokensReached)) {
+      absl::AnyInvocable<void(Message)> capture_complete_message =
+          [&callback_state, &complete_message_callback](Message message) {
+            if (callback_state.first_error.ok() && complete_message_callback) {
+              complete_message_callback(std::move(message));
+            }
+          };
       SendCompleteMessage(user_callback, accumulated_response_text,
                           model_data_processor, processor_args, cursor,
-                          complete_message_callback,
+                          capture_complete_message,
                           inside_channel ? active_channel_name : "", channels,
                           open_channel_name);
       cursor = accumulated_response_text.size();
