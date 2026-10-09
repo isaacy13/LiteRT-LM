@@ -1,0 +1,49 @@
+name: Latest stable native source
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: latest-stable-native-refresh
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ vars.GUIDEAI_NATIVE_SOURCE_REF || github.event.repository.default_branch }}
+          fetch-depth: 0
+          lfs: false
+      - name: Prepare current latest stable without dropping fork contracts
+        run: |
+          git config user.name 'GuideAI dependency updates'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 tools/prepare_latest_native.py
+      - name: Publish candidate branch and run full existing producer
+        run: |
+          if [ ! -f latest-refresh.json ]; then exit 0; fi
+          branch=$(python3 -c 'import json; print(json.load(open("latest-refresh.json"))["branch"])')
+          python3 tools/ensure_latest_candidate.py --check-remote --receipt latest-refresh.json
+          git push origin "HEAD:refs/heads/$branch"
+          python3 tools/ensure_latest_candidate.py --ensure-review --receipt latest-refresh.json \
+            --pr-base "${{ vars.GUIDEAI_NATIVE_SOURCE_REF || github.event.repository.default_branch }}" \
+            --workflow native-byte-contract.yml --title 'Update to latest stable LiteRT-LM' \
+            --body 'Automatically resolved current stable source. Full native host/framework and app/model qualification is required; no output or oracle changes.'
+      - name: Retain source preparation or explicit refusal
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: latest-stable-source-preparation
+          path: |
+            latest-refresh.json
+            latest-refresh-refusal.json
+          if-no-files-found: ignore

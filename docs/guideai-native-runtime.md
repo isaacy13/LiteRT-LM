@@ -46,3 +46,12 @@ Packaging requires all four exports at their respective owners in both device
 and simulator slices, alongside every public C API export and the full runtime
 dependency graph. The manifest records these owners. A symbol in another
 framework cannot satisfy the required owner's export check.
+
+## Latest stable refresh
+
+The daily refresh discovers the latest stable upstream release and merges it
+with `GUIDEAI_NATIVE_SOURCE_REF`, the explicitly configured maintained fork
+source. Conflicts stop preparation. An identical existing candidate is reused;
+divergent edits, closed reviews or failed verification require review. Existing
+push runs qualify for reuse only with the full native workflow and exact source
+artifact evidence. No automatic merge or release publication is performed.
