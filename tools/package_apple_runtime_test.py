@@ -331,22 +331,58 @@ class ApplePublicCExportTests(unittest.TestCase):
                 self.inspectFixture(changed_header=header)
 
     def testEachGemmaCExportMissingFromSecondSliceRefuses(self):
-        from package_apple_runtime import GEMMA_PROVIDER_FUNCTIONS
+        from package_apple_runtime import GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS
         for name in sorted(GEMMA_PROVIDER_FUNCTIONS):
             with self.subTest(name=name):
-                self.inspectFixture(missing=('GemmaModelConstraintProvider', name))
+                self.inspectFixture(missing=(GEMMA_ABI_OWNERS[name], name))
 
-    def inspectFixture(self, missing=None, changed_header=None):
+    def testEveryGemmaCExportHasExactlyOneDeclaredOwner(self):
+        from package_apple_runtime import GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS
+        self.assertEqual(set(GEMMA_ABI_OWNERS), GEMMA_PROVIDER_FUNCTIONS)
+        self.assertEqual(len(GEMMA_ABI_OWNERS), 4)
+        self.assertEqual({name for name, owner in GEMMA_ABI_OWNERS.items() if owner == 'CLiteRTLM'},
+                         {'LiteRtLmConstraint_Destroy'})
+        self.assertEqual(sum(owner == 'GemmaModelConstraintProvider' for owner in GEMMA_ABI_OWNERS.values()), 3)
+
+    def testIncompleteOrUnknownGemmaAbiOwnerMapRefuses(self):
+        from package_apple_runtime import GEMMA_ABI_OWNERS
+        missing = dict(GEMMA_ABI_OWNERS); missing.pop('LiteRtLmConstraint_Destroy')
+        wrong = dict(GEMMA_ABI_OWNERS); wrong['LiteRtLmConstraint_Destroy'] = 'UnknownRuntime'
+        for owners in [missing, wrong]:
+            with self.subTest(owners=owners), patch('package_apple_runtime.GEMMA_ABI_OWNERS', owners), \
+                    self.assertRaisesRegex(RuntimeError, 'Invalid native tool constraint provider ABI ownership'):
+                inspect({})
+
+    def testEachGemmaCExportMissingFromFirstSliceRefuses(self):
+        from package_apple_runtime import GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS
+        for name in sorted(GEMMA_PROVIDER_FUNCTIONS):
+            with self.subTest(name=name):
+                self.inspectFixture(missing=(GEMMA_ABI_OWNERS[name], name), missing_slice='ios-arm64')
+
+    def testGenericDestroyInProviderCannotReplaceItsRuntimeOwner(self):
+        self.inspectFixture(wrong_owner=('LiteRtLmConstraint_Destroy', 'GemmaModelConstraintProvider'))
+
+    def testProviderCreationInRuntimeCannotReplaceItsProviderOwner(self):
+        self.inspectFixture(wrong_owner=('LiteRtLmGemmaModelConstraintProvider_Create', 'CLiteRTLM'))
+
+    def inspectFixture(self, missing=None, changed_header=None,
+                       missing_slice='ios-arm64-simulator', wrong_owner=None):
         # Structural Python control only: every native command is mocked.
         import plistlib
         import shutil
         from package_apple_runtime import (ROOT, PUBLIC_C_HEADERS, public_c_exports,
-                                          GEMMA_PROVIDER_FUNCTIONS, SAMPLER_FUNCTIONS, SLICES)
+                                          GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS, SAMPLER_FUNCTIONS, SLICES)
         core = public_c_exports(ROOT / 'c')
-        exports = {'CLiteRTLM': core, 'LiteRtRuntime': {'kLiteRtRuntimeBuiltin'},
-                   'GemmaModelConstraintProvider': GEMMA_PROVIDER_FUNCTIONS,
+        exports = {'CLiteRTLM': set(core), 'LiteRtRuntime': {'kLiteRtRuntimeBuiltin'},
+                   'GemmaModelConstraintProvider': set(),
                    'LiteRtMetalAccelerator': {'LiteRtAcceleratorImpl'},
                    'LiteRtTopKMetalSampler': SAMPLER_FUNCTIONS}
+        for name, owner in GEMMA_ABI_OWNERS.items():
+            exports[owner].add(name)
+        if wrong_owner:
+            name, owner = wrong_owner
+            exports[GEMMA_ABI_OWNERS[name]].remove(name)
+            exports[owner].add(name)
         with tempfile.TemporaryDirectory() as temporary:
             frameworks = {}
             for name in ['CLiteRTLM', *LIBRARIES.values()]:
@@ -390,18 +426,20 @@ class ApplePublicCExportTests(unittest.TestCase):
                         if binary.name == 'CLiteRTLM' else [])]
             def symbols(binary):
                 result = set(exports[binary.name])
-                if missing and binary.name == missing[0] and 'ios-arm64-simulator' in binary.parts:
+                if missing and binary.name == missing[0] and missing_slice in binary.parts:
                     result.remove(missing[1])
                 return result
             with patch('package_apple_runtime.run', side_effect=native), \
                     patch('package_apple_runtime.dependencies', side_effect=linked), \
                     patch('package_apple_runtime.exported_symbols', side_effect=symbols):
-                if missing or changed_header:
+                if missing or changed_header or wrong_owner:
                     with self.assertRaisesRegex(RuntimeError, 'Missing public|tool constraint|header differs'):
                         inspect(frameworks)
-                    blocked_name = missing[0] if missing else 'CLiteRTLM'
+                    blocked_name = (GEMMA_ABI_OWNERS[wrong_owner[0]] if wrong_owner
+                                    else missing[0] if missing else 'CLiteRTLM')
+                    blocked_slice = 'ios-arm64' if wrong_owner else missing_slice
                     self.assertFalse(any(p.name == blocked_name + '.framework'
-                                         and 'ios-arm64-simulator' in p.parts for p in signatures))
+                                         and blocked_slice in p.parts for p in signatures))
                 else:
                     result = inspect(frameworks)
                     self.assertEqual(len(result), 10)

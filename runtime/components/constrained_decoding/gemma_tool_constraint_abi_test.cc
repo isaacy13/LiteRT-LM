@@ -112,5 +112,73 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(kLiteRtLmGemmaFuncallFormatPythonStyle,
                       kLiteRtLmGemmaFuncallFormatFcStyle));
 
+#if defined(__APPLE__)
+TEST_P(GemmaToolConstraintAbiTest, CreatedConstraintReturnsThroughOwnedCAbi) {
+  const bool fc = GetParam() == kLiteRtLmGemmaFuncallFormatFcStyle;
+  const auto path = std::filesystem::path(::testing::SrcDir()) /
+                    "litert_lm/runtime/components/testdata" /
+                    (fc ? "function_gemma_sentencepiece.model"
+                        : "gemma3_sentencepiece.model");
+  ASSERT_OK_AND_ASSIGN(
+      auto tokenizer,
+      ::litert::support::SentencePieceTokenizer::CreateFromFile(path.string()));
+  const auto model = tokenizer->GetProcessor().model_proto().SerializeAsString();
+  const int eos[] = {1};
+  const int* stops[] = {eos};
+  const size_t lengths[] = {1};
+  std::unique_ptr<LiteRtLmGemmaModelConstraintProvider,
+                  decltype(&LiteRtLmGemmaModelConstraintProvider_Destroy)>
+      provider(LiteRtLmGemmaModelConstraintProvider_Create(
+                   model.data(), model.size(), stops, lengths, 1),
+               &LiteRtLmGemmaModelConstraintProvider_Destroy);
+  ASSERT_NE(provider, nullptr);
+  const LiteRtLmGemmaModelConstraintOptions options = {
+      .funcall_format = GetParam(),
+      .constraint_mode = kLiteRtLmGemmaConstraintModeFunctionCallOnly,
+      .code_fence_start = "<start_function_call>",
+      .code_fence_end = "<end_function_call>",
+      .open_quote = fc ? "<escape>" : "\"",
+      .close_quote = fc ? "<escape>" : "\"",
+      .function_response_start = "<start_function_response>",
+  };
+  constexpr char tools[] = R"([{"name":"read_facts","parameters":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}}])";
+  std::unique_ptr<LiteRtLmConstraint, decltype(&LiteRtLmConstraint_Destroy)>
+      constraint(LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools(
+                     provider.get(), tools, &options),
+                 &LiteRtLmConstraint_Destroy);
+  ASSERT_NE(constraint, nullptr);
+  EXPECT_EQ(reinterpret_cast<Constraint*>(constraint.get())->GetVocabularySize(),
+            tokenizer->GetVocabSize());
+  constraint.reset();  // Actual opaque allocation returns through the owned C ABI.
+  EXPECT_EQ(constraint, nullptr);
+  provider.reset();   // The producer remains alive until its constraint returned.
+}
+
+TEST(ConstraintOwnedCAbiTest, NullDestructionIsSafe) {
+  LiteRtLmConstraint_Destroy(nullptr);
+}
+
+class DestructionWitnessConstraint final : public Constraint {
+ public:
+  explicit DestructionWitnessConstraint(int& count) : count_(count) {}
+  ~DestructionWitnessConstraint() override { ++count_; }
+  std::unique_ptr<State> Start() const override { return nullptr; }
+  bool IsEnded(const State&) const override { return true; }
+  int GetVocabularySize() const override { return 0; }
+  absl::StatusOr<std::unique_ptr<State>> ComputeNext(const State&, int) const override {
+    return std::unique_ptr<State>();
+  }
+ private:
+  int& count_;
+};
+
+TEST(ConstraintOwnedCAbiTest, OpaqueDestructionUsesTheVirtualDestructorOnce) {
+  int destructions = 0;
+  auto* constraint = new DestructionWitnessConstraint(destructions);
+  LiteRtLmConstraint_Destroy(reinterpret_cast<LiteRtLmConstraint*>(constraint));
+  EXPECT_EQ(destructions, 1);
+}
+#endif
+
 }  // namespace
 }  // namespace litert::lm

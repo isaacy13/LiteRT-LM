@@ -42,6 +42,14 @@ GEMMA_PROVIDER_FUNCTIONS = {
     "LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools",
     "LiteRtLmConstraint_Destroy",
 }
+# All four declarations remain required. The immutable provider owns its three
+# factory/provider entry points; the source-built runtime owns generic deletion.
+GEMMA_ABI_OWNERS = {
+    "LiteRtLmGemmaModelConstraintProvider_Create": "GemmaModelConstraintProvider",
+    "LiteRtLmGemmaModelConstraintProvider_Destroy": "GemmaModelConstraintProvider",
+    "LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools": "GemmaModelConstraintProvider",
+    "LiteRtLmConstraint_Destroy": "CLiteRTLM",
+}
 MAX_PUBLIC_HEADER_BYTES = 1024 * 1024
 _C_TYPE = (r"(?:const\s+)?(?:void|bool|char|int|float|double|size_t|u?int(?:8|16|32|64)_t|"
            r"LiteRtLm[A-Za-z0-9_]+)(?:\s*\*\s*(?:const\b\s*)?)*")
@@ -259,6 +267,9 @@ def zip_directory(directory, archive):
 
 
 def inspect(frameworks):
+    if (set(GEMMA_ABI_OWNERS) != GEMMA_PROVIDER_FUNCTIONS
+            or set(GEMMA_ABI_OWNERS.values()) != {"CLiteRTLM", "GemmaModelConstraintProvider"}):
+        raise RuntimeError("Invalid native tool constraint provider ABI ownership")
     results = []
     allowed = {install_name(name) for name in frameworks}
     expected_c_exports = public_c_exports(ROOT / "c") if "CLiteRTLM" in frameworks else set()
@@ -288,6 +299,10 @@ def inspect(frameworks):
                 raise RuntimeError(f"Incorrect install name at {binary}: {own_id}")
             validate_dependencies(name, linked, allowed)
             symbols = exported_symbols(binary)
+            required_gemma_exports = {symbol for symbol, owner in GEMMA_ABI_OWNERS.items() if owner == name}
+            if not required_gemma_exports <= symbols:
+                raise RuntimeError(f"Missing native tool constraint provider ABI at {binary}: "
+                                   + repr(sorted(required_gemma_exports - symbols)))
             if name == "CLiteRTLM":
                 for header in PUBLIC_C_HEADERS:
                     if digest(framework / "Headers" / header) != digest(ROOT / "c" / header):
@@ -299,14 +314,13 @@ def inspect(frameworks):
                 raise RuntimeError(f"Missing pinned Metal accelerator definition at {binary}")
             elif name == "LiteRtTopKMetalSampler" and not SAMPLER_FUNCTIONS <= symbols:
                 raise RuntimeError(f"Missing pinned Metal sampler functions at {binary}")
-            elif name == "GemmaModelConstraintProvider" and not GEMMA_PROVIDER_FUNCTIONS <= symbols:
-                raise RuntimeError(f"Missing native tool constraint provider at {binary}")
             run("codesign", "--verify", "--strict", str(framework))
             if list(framework.rglob("*.dylib")) or list(framework.glob("Frameworks/*")):
                 raise RuntimeError(f"Unsupported nested runtime payload at {framework}")
             results.append({"name": name, "slice": identifier, "platform": platform,
                             "sha256": digest(binary), "dependencies": linked,
-                            "minimumOS": minimum, "frameworkMinimumOSVersion": metadata["MinimumOSVersion"]})
+                            "minimumOS": minimum, "frameworkMinimumOSVersion": metadata["MinimumOSVersion"],
+                            "requiredGemmaABIExports": sorted(required_gemma_exports)})
     return results
 
 
@@ -380,7 +394,8 @@ def package(source_archive, destination):
         (destination / "SHA256SUMS").write_text("".join(
             f'{entry["sha256"]}  {entry["file"]}\n' for entry in archives.values()))
         report = {"source": source, "modelQueries": 0, "phoneAcceptance": False,
-                  "packagedDependencyClosure": True, "frameworks": results, "archives": archives}
+                  "packagedDependencyClosure": True, "frameworks": results, "archives": archives,
+                  "gemmaABIExportOwners": GEMMA_ABI_OWNERS}
         (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
 

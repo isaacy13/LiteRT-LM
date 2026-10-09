@@ -33,3 +33,16 @@ also cover no-session allocation, deferred preface, native BOS handling, frozen
 time, C JSON conversion, malformed input, media refusal, reentry and tokenizer
 failure. The existing native regression controls remain required. Framework and
 Swift adoption require matching headers, exports and device qualification.
+
+## Apple constraint ownership
+
+The pinned Apple provider exports its three creation/provider entry points. The
+source-built `CLiteRTLM` owns `LiteRtLmConstraint_Destroy`, which uses the existing
+virtual `Constraint` destructor and accepts null. The provider remains alive until
+its constraints have been destroyed. This supplies the previously declared C
+entry point without changing the processors' existing C++ ownership.
+
+Packaging requires all four exports at their respective owners in both device
+and simulator slices, alongside every public C API export and the full runtime
+dependency graph. The manifest records these owners. A symbol in another
+framework cannot satisfy the required owner's export check.

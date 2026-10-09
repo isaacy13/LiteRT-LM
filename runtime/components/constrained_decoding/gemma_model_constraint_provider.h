@@ -113,6 +113,8 @@ LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools(
     const LiteRtLmGemmaModelConstraintOptions* options);
 
 // Destroys a generic Constraint instance created by the provider.
+// On Apple this entry point is owned by the source-built runtime, not the
+// immutable provider dynamic library. It uses the existing virtual destructor.
 GEMMA_MODEL_CONSTRAINT_PROVIDER_EXPORT void LiteRtLmConstraint_Destroy(
     LiteRtLmConstraint* constraint);
 }
