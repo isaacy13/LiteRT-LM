@@ -76,6 +76,7 @@ jobs:
           key: native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-${{ github.sha }}
           restore-keys: |
             native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**') }}-
+            native-bazel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-
       - name: Verify pinned Apple runtime slices
         run: python3 tools/verify_apple_prebuilt_runtime.py
       - name: Package closure rejection controls
