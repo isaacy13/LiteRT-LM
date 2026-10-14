@@ -207,21 +207,31 @@ cc_test(
     ],
 )
 
-# iOS runtime APIs are strong dependencies, packaged as separate frameworks.
+# Apple runtime APIs are strong dependencies, packaged as separate frameworks.
 cc_library(
     name = "apple_metal_sampler_lib",
+    defines = select({
+        "//build_config:macos_arm64_metal_runtime": ["LITERT_LM_MAC_METAL_RUNTIME=1"],
+        "//conditions:default": [],
+    }),
     srcs = select({
         "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtTopKMetalSampler.dylib"],
         "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtTopKMetalSampler.dylib"],
+        "//build_config:macos_arm64_metal_runtime": ["//prebuilt/macos_arm64:libLiteRtTopKMetalSampler.dylib"],
         "//conditions:default": [],
     }),
 )
 
 cc_library(
     name = "apple_metal_accelerator_lib",
+    defines = select({
+        "//build_config:macos_arm64_metal_runtime": ["LITERT_LM_MAC_METAL_RUNTIME=1"],
+        "//conditions:default": [],
+    }),
     srcs = select({
         "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtMetalAccelerator.dylib"],
         "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtMetalAccelerator.dylib"],
+        "//build_config:macos_arm64_metal_runtime": ["//prebuilt/macos_arm64:libLiteRtMetalAccelerator.dylib"],
         "//conditions:default": [],
     }),
 )

@@ -9,12 +9,14 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
 import shlex
 import subprocess
+import stat
 import tempfile
 import zipfile
 
@@ -28,6 +30,7 @@ LIBRARIES = {
 }
 SLICES = {"ios-arm64": ("ios_arm64", "IOS"),
           "ios-arm64-simulator": ("ios_sim_arm64", "IOSSIMULATOR")}
+MACOS_ARM64_SLICES = {"macos-arm64": ("macos_arm64", "MACOS")}
 PUBLIC_C_HEADERS = ("api_export.h", "conversation.h", "embedding_engine.h", "engine.h",
                     "error_reporter.h", "experimental.h", "model_info.h")
 PUBLIC_C_SENTINELS = {
@@ -171,8 +174,9 @@ def validate_public_c_exports(symbols, expected):
         raise RuntimeError("Missing public C API exports: " + repr(sorted(missing)))
 
 
-def install_name(name):
-    return f"@rpath/{name}.framework/{name}"
+def install_name(name, *, platform="IOS"):
+    version = "Versions/A/" if platform == "MACOS" else ""
+    return f"@rpath/{name}.framework/{version}{name}"
 
 
 def dependencies(binary):
@@ -185,13 +189,13 @@ def exported_symbols(binary):
             for line in run("nm", "-gU", str(binary)).splitlines() if line.split()}
 
 
-def validate_dependencies(name, linked, allowed):
+def validate_dependencies(name, linked, allowed, *, platform="IOS"):
     missing = [dependency for dependency in linked
                if not dependency.startswith(("/usr/lib/", "/System/Library/")) and dependency not in allowed]
     if missing:
         raise RuntimeError(f"Unpackaged dependencies for {name}: {missing}")
     if name == "CLiteRTLM":
-        required = {install_name(dependency) for dependency in LIBRARIES.values()}
+        required = {install_name(dependency, platform=platform) for dependency in LIBRARIES.values()}
         if not required <= set(linked):
             raise RuntimeError("Native iOS runtime APIs are not all strong dependencies")
 
@@ -241,63 +245,153 @@ def upstream_release_version():
 
 
 def framework_metadata(name, platform, binary):
-    minimum = minimum_os_from_build(run("vtool", "-show-build", str(binary)), platform)
+    minimum = minimum_os_from_build(
+        run("vtool", "-show-build", str(binary)), platform,
+        supported_platforms=("MACOS",) if platform == "MACOS" else ("IOS", "IOSSIMULATOR"))
     return {"CFBundleExecutable": name, "CFBundleIdentifier": f"com.guideai.litert.{name}",
             "CFBundleName": name, "CFBundlePackageType": "FMWK", "CFBundleVersion": "1",
             "CFBundleShortVersionString": upstream_release_version(), "MinimumOSVersion": minimum,
-            "CFBundleSupportedPlatforms": ["iPhoneSimulator" if platform == "IOSSIMULATOR" else "iPhoneOS"]}
+            "CFBundleSupportedPlatforms": ["MacOSX" if platform == "MACOS" else
+                                          "iPhoneSimulator" if platform == "IOSSIMULATOR" else "iPhoneOS"]}
 
 
-def rewrite_linkage(binary, name):
+def rewrite_linkage(binary, name, *, platform="IOS"):
     # Rewrite the signed copy, then replace its signature when the completed
     # framework is sealed. Early removal can leave signature-alignment padding
     # at the end of __LINKEDIT that older install_name_tool versions reject.
-    run("install_name_tool", "-id", install_name(name), str(binary))
+    run("install_name_tool", "-id", install_name(name, platform=platform), str(binary))
     for dependency in dependencies(binary):
         old = dependency.removeprefix("@rpath/")
         if dependency.startswith("@rpath/") and old in LIBRARIES:
-            run("install_name_tool", "-change", dependency, install_name(LIBRARIES[old]), str(binary))
+            run("install_name_tool", "-change", dependency, install_name(LIBRARIES[old], platform=platform), str(binary))
 
 
-def zip_directory(directory, archive):
+def create_framework_layout(framework, name, platform):
+    if platform != "MACOS":
+        (framework / "Headers").mkdir(parents=True)
+        (framework / "Modules").mkdir()
+        return framework / "Info.plist"
+    version = framework / "Versions" / "A"
+    for directory in ("Headers", "Modules", "Resources"):
+        (version / directory).mkdir(parents=True, exist_ok=True)
+    (framework / "Versions" / "Current").symlink_to("A", target_is_directory=True)
+    for entry in (name, "Headers", "Modules", "Resources"):
+        (framework / entry).symlink_to("Versions/Current/" + entry,
+                                      target_is_directory=entry != name)
+    return version / "Resources" / "Info.plist"
+
+
+def validate_macos_framework_layout(framework, name):
+    expected = {name: "Versions/Current/" + name,
+                "Headers": "Versions/Current/Headers", "Modules": "Versions/Current/Modules",
+                "Resources": "Versions/Current/Resources", "Versions/Current": "A"}
+    for path, target in expected.items():
+        link = framework / path
+        if not link.is_symlink() or os.readlink(link) != target:
+            raise RuntimeError(f"Invalid Mac framework link: {link}")
+    version = framework / "Versions" / "A"
+    if not version.is_dir() or version.is_symlink():
+        raise RuntimeError(f"Invalid Mac framework version: {version}")
+    for directory in ("Headers", "Modules", "Resources"):
+        path = version / directory
+        if not path.is_dir() or path.is_symlink():
+            raise RuntimeError(f"Invalid Mac framework directory: {path}")
+    for path in (version / name, version / "Resources" / "Info.plist"):
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"Invalid Mac framework content: {path}")
+
+
+def zip_directory(directory, archive, *, preserve_symlinks=False):
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as bundle:
         for path in sorted(directory.rglob("*")):
-            if path.is_file():
-                bundle.write(path, path.relative_to(directory.parent))
+            relative = path.relative_to(directory.parent)
+            if preserve_symlinks and path.is_symlink():
+                entry = zipfile.ZipInfo(str(relative))
+                entry.create_system = 3
+                entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+                bundle.writestr(entry, os.readlink(path).encode("utf-8"))
+            elif path.is_file():
+                bundle.write(path, relative)
+            elif preserve_symlinks and path.is_dir():
+                bundle.write(path, relative)
 
 
-def inspect(frameworks):
+def extract_symlink_archive(archive, destination):
+    """Restore our Mac archive for structural and codesign round-trip checks."""
+    with zipfile.ZipFile(archive) as bundle:
+        entries = {}
+        links = {}
+        for entry in bundle.infolist():
+            path = PurePosixPath(entry.filename)
+            if (path.is_absolute() or ".." in path.parts or "\\" in entry.filename
+                    or not path.parts or path in entries):
+                raise RuntimeError("Unsafe or duplicate Mac archive path")
+            entries[path] = entry
+            if stat.S_ISLNK(entry.external_attr >> 16):
+                target = bundle.read(entry).decode("utf-8")
+                relative = PurePosixPath(target)
+                if (relative.is_absolute() or ".." in relative.parts or not relative.parts
+                        or "\\" in target):
+                    raise RuntimeError("Unsafe Mac archive symlink")
+                links[path] = target
+        if any(parent in links for path in entries for parent in path.parents):
+            raise RuntimeError("Mac archive content traverses a symlink")
+        for path, entry in entries.items():
+            if path in links:
+                continue
+            output = destination.joinpath(*path.parts)
+            if entry.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+            else:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(entry) as source, output.open("xb") as target:
+                    shutil.copyfileobj(source, target)
+                mode = (entry.external_attr >> 16) & 0o777
+                if mode:
+                    output.chmod(mode)
+        for path, target in links.items():
+            output = destination.joinpath(*path.parts)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.symlink_to(target)
+
+
+def inspect(frameworks, *, slices=SLICES):
     if (set(GEMMA_ABI_OWNERS) != GEMMA_PROVIDER_FUNCTIONS
             or set(GEMMA_ABI_OWNERS.values()) != {"CLiteRTLM", "GemmaModelConstraintProvider"}):
         raise RuntimeError("Invalid native tool constraint provider ABI ownership")
     results = []
-    allowed = {install_name(name) for name in frameworks}
     expected_c_exports = public_c_exports(ROOT / "c") if "CLiteRTLM" in frameworks else set()
-    for identifier, (_, platform) in SLICES.items():
+    for identifier, (_, platform) in slices.items():
+        allowed = {install_name(name, platform=platform) for name in frameworks}
         for name, xcframework in frameworks.items():
             info = plistlib.loads((xcframework / "Info.plist").read_bytes())
             entries = info["AvailableLibraries"]
-            if len(entries) != 2 or {entry["LibraryIdentifier"] for entry in entries} != set(SLICES):
+            if len(entries) != len(slices) or {entry["LibraryIdentifier"] for entry in entries} != set(slices):
                 raise RuntimeError(f"Incorrect slice coverage in {xcframework}")
             entry = next(entry for entry in entries if entry["LibraryIdentifier"] == identifier)
             expected_variant = "simulator" if platform == "IOSSIMULATOR" else None
-            if (entry["SupportedArchitectures"] != ["arm64"] or entry["SupportedPlatform"] != "ios"
+            if (entry["SupportedArchitectures"] != ["arm64"] or entry["SupportedPlatform"] != ("macos" if platform == "MACOS" else "ios")
                     or entry.get("SupportedPlatformVariant") != expected_variant):
                 raise RuntimeError(f"Incorrect declared platform in {xcframework}/{identifier}")
             framework = xcframework / identifier / entry["LibraryPath"]
             binary = framework / name
-            metadata = plistlib.loads((framework / "Info.plist").read_bytes())
+            if platform == "MACOS":
+                validate_macos_framework_layout(framework, name)
+            metadata_path = framework / ("Resources/Info.plist" if platform == "MACOS" else "Info.plist")
+            metadata = plistlib.loads(metadata_path.read_bytes())
             if metadata.get("CFBundleExecutable") != name or metadata.get("CFBundlePackageType") != "FMWK":
                 raise RuntimeError(f"Invalid framework metadata at {framework}")
             if run("lipo", "-archs", str(binary)) != "arm64":
                 raise RuntimeError(f"Wrong architecture at {binary}")
-            minimum = minimum_os_from_build(run("vtool", "-show-build", str(binary)), platform)
+            minimum = minimum_os_from_build(
+                run("vtool", "-show-build", str(binary)), platform,
+                supported_platforms=("MACOS",) if platform == "MACOS" else ("IOS", "IOSSIMULATOR"))
             validate_minimum_os_metadata(minimum, metadata.get("MinimumOSVersion"))
             linked = dependencies(binary)
             own_id = run("otool", "-D", str(binary)).splitlines()[1:]
-            if own_id != [install_name(name)]:
+            if own_id != [install_name(name, platform=platform)]:
                 raise RuntimeError(f"Incorrect install name at {binary}: {own_id}")
-            validate_dependencies(name, linked, allowed)
+            validate_dependencies(name, linked, allowed, platform=platform)
             symbols = exported_symbols(binary)
             required_gemma_exports = {symbol for symbol, owner in GEMMA_ABI_OWNERS.items() if owner == name}
             if not required_gemma_exports <= symbols:
@@ -325,7 +419,7 @@ def inspect(frameworks):
 
 
 @contextmanager
-def retained_package_work(source_archive, destination, source):
+def retained_package_work(source_archive, destination, source, *, preserve_symlinks=False):
     failure_directory = destination.with_name(destination.name + "-failure")
     if failure_directory.exists():
         raise RuntimeError("Never replace retained package failure evidence")
@@ -336,7 +430,7 @@ def retained_package_work(source_archive, destination, source):
         except Exception as error:
             # Preserve the binaries at the actual failing operation. The original
             # Bazel archive is uploaded separately, before any Mach-O edits.
-            shutil.copytree(work, failure_directory)
+            shutil.copytree(work, failure_directory, symlinks=preserve_symlinks)
             (failure_directory / "FAILURE.json").write_text(json.dumps({
                 "source": source, "sourceArchiveSHA256": digest(source_archive),
                 "artifactAcceptance": False, "modelQueries": 0,
@@ -345,57 +439,97 @@ def retained_package_work(source_archive, destination, source):
             raise
 
 
-def package(source_archive, destination):
+def package(source_archive, destination, *, macos_metal_arm64=False):
     if destination.exists():
         raise RuntimeError("Never replace a retained package")
-    verify()
+    slices = MACOS_ARM64_SLICES if macos_metal_arm64 else SLICES
+    if macos_metal_arm64:
+        verify(platforms={"macos_arm64": "MACOS"})
+    else:
+        verify()
     source = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
     if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("Package only committed source")
-    with retained_package_work(source_archive, destination, source) as work:
-        with zipfile.ZipFile(source_archive) as bundle:
-            if any(Path(member.filename).is_absolute() or ".." in Path(member.filename).parts
-                   for member in bundle.infolist()):
-                raise RuntimeError("Unsafe framework archive path")
-            bundle.extractall(work)
-        capi = work / "CLiteRTLM.xcframework"
+    with retained_package_work(
+            source_archive, destination, source, preserve_symlinks=macos_metal_arm64) as work:
+        capi_name = "CLiteRTLM_mac" if macos_metal_arm64 else "CLiteRTLM"
+        capi = work / f"{capi_name}.xcframework"
+        if macos_metal_arm64:
+            if run("lipo", "-archs", str(source_archive)) != "arm64":
+                raise RuntimeError("Mac Metal package requires exactly arm64")
+            if run("otool", "-D", str(source_archive)).splitlines()[1:] != ["@rpath/libCLiteRTLM_mac.dylib"]:
+                raise RuntimeError("Unexpected source Mac C API install name")
+            framework = work / "macos-input" / "CLiteRTLM.framework"
+            metadata_path = create_framework_layout(framework, "CLiteRTLM", "MACOS")
+            shutil.copy2(source_archive, framework / "CLiteRTLM")
+            for header in PUBLIC_C_HEADERS:
+                shutil.copy2(ROOT / "c" / header, framework / "Headers" / header)
+            (framework / "Modules" / "module.modulemap").write_text(
+                'framework module CLiteRTLM {\n' + ''.join(
+                    f'  header "{header}"\n' for header in PUBLIC_C_HEADERS) + '  export *\n}\n')
+            metadata_path.write_bytes(plistlib.dumps(
+                framework_metadata("CLiteRTLM", "MACOS", framework / "CLiteRTLM")))
+            run("xcodebuild", "-create-xcframework", "-framework", str(framework), "-output", str(capi))
+        else:
+            with zipfile.ZipFile(source_archive) as bundle:
+                if any(Path(member.filename).is_absolute() or ".." in Path(member.filename).parts
+                       for member in bundle.infolist()):
+                    raise RuntimeError("Unsafe framework archive path")
+                bundle.extractall(work)
         frameworks = {"CLiteRTLM": capi}
-        for identifier, (directory, platform) in SLICES.items():
+        for identifier, (directory, platform) in slices.items():
             framework = capi / identifier / "CLiteRTLM.framework"
-            rewrite_linkage(framework / "CLiteRTLM", "CLiteRTLM")
+            rewrite_linkage(framework / "CLiteRTLM", "CLiteRTLM", platform=platform)
             run("codesign", "--force", "--sign", "-", str(framework))
             for library, name in LIBRARIES.items():
                 framework = work / identifier / f"{name}.framework"
-                (framework / "Headers").mkdir(parents=True)
-                (framework / "Modules").mkdir()
+                metadata_path = create_framework_layout(framework, name, platform)
                 shutil.copy2(ROOT / "prebuilt" / directory / library, framework / name)
-                (framework / "Info.plist").write_bytes(plistlib.dumps(
+                metadata_path.write_bytes(plistlib.dumps(
                     framework_metadata(name, platform, framework / name)))
                 (framework / "Headers" / "RuntimeDependency.h").write_text("// APIs are bound internally by CLiteRTLM.\n")
                 (framework / "Modules" / "module.modulemap").write_text(
                     f'framework module {name} {{\n  umbrella header "RuntimeDependency.h"\n  export *\n}}\n')
-                rewrite_linkage(framework / name, name)
+                rewrite_linkage(framework / name, name, platform=platform)
                 run("codesign", "--force", "--sign", "-", str(framework))
         for name in LIBRARIES.values():
-            target = work / f"{name}.xcframework"
+            target_name = name + ("_mac" if macos_metal_arm64 else "")
+            target = work / f"{target_name}.xcframework"
             command = ["xcodebuild", "-create-xcframework"]
-            for identifier in SLICES:
+            for identifier in slices:
                 command += ["-framework", str(work / identifier / f"{name}.framework")]
             run(*command, "-output", str(target))
             frameworks[name] = target
-        results = inspect(frameworks)
+        results = inspect(frameworks, slices=slices)
         destination.mkdir()
         archives = {}
+        roundtrip_frameworks = {}
         for name, framework in frameworks.items():
-            archive = destination / f"{name}.xcframework.zip"
-            zip_directory(framework, archive)
+            if macos_metal_arm64:
+                run("codesign", "--force", "--sign", "-", str(framework))
+                run("codesign", "--verify", "--strict", str(framework))
+            archive_name = name + ("_mac" if macos_metal_arm64 else "")
+            archive = destination / f"{archive_name}.xcframework.zip"
+            zip_directory(framework, archive, preserve_symlinks=macos_metal_arm64)
+            if macos_metal_arm64:
+                restored = work / "zip-roundtrip" / name
+                extract_symlink_archive(archive, restored)
+                restored_framework = restored / framework.name
+                run("codesign", "--verify", "--strict", str(restored_framework))
+                roundtrip_frameworks[name] = restored_framework
             archives[name] = {"file": archive.name, "sha256": digest(archive)}
+        if macos_metal_arm64 and inspect(roundtrip_frameworks, slices=slices) != results:
+            raise RuntimeError("Mac archive round-trip changed the inspected runtime")
         (destination / "SOURCE_COMMIT").write_text(source + "\n")
         (destination / "SHA256SUMS").write_text("".join(
             f'{entry["sha256"]}  {entry["file"]}\n' for entry in archives.values()))
         report = {"source": source, "modelQueries": 0, "phoneAcceptance": False,
                   "packagedDependencyClosure": True, "frameworks": results, "archives": archives,
                   "gemmaABIExportOwners": GEMMA_ABI_OWNERS}
+        if macos_metal_arm64:
+            report.update({"platform": "MACOS", "architectures": ["arm64"],
+                           "macAppAcceptance": False, "canonicalProcessingQualification": False,
+                           "capacityQualification": False, "gpuRuntimeQualification": False})
         (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
 
@@ -491,8 +625,14 @@ if __name__ == "__main__":
     parser.add_argument("destination", type=Path)
     parser.add_argument("--macos-arm64", action="store_true",
                         help="Package an existing same-source Mac arm64 C API dylib")
+    parser.add_argument("--macos-metal-arm64", action="store_true",
+                        help="Package same-source Mac arm64 C API with exact pinned Metal runtime closure")
     arguments = parser.parse_args()
-    if arguments.macos_arm64:
+    if arguments.macos_arm64 and arguments.macos_metal_arm64:
+        parser.error("Choose exactly one Mac packaging mode")
+    if arguments.macos_metal_arm64:
+        package(arguments.source_archive, arguments.destination, macos_metal_arm64=True)
+    elif arguments.macos_arm64:
         package_macos_arm64(arguments.source_archive, arguments.destination)
     else:
         package(arguments.source_archive, arguments.destination)
