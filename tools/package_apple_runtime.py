@@ -207,8 +207,8 @@ def minimum_os_components(value):
     return tuple(parts)
 
 
-def minimum_os_from_build(build, platform):
-    if platform not in {"IOS", "IOSSIMULATOR"}:
+def minimum_os_from_build(build, platform, *, supported_platforms=("IOS", "IOSSIMULATOR")):
+    if platform not in supported_platforms:
         raise RuntimeError(f"Unsupported Apple runtime platform: {platform}")
     blocks = re.findall(r"^\s*Load command [0-9]+[ \t]*$", build, re.M)
     commands = re.findall(r"^\s*cmd\s+(\S+)\s*$", build, re.M)
@@ -400,9 +400,99 @@ def package(source_archive, destination):
         print(json.dumps(report, indent=2))
 
 
+def package_macos_arm64(source_library, destination):
+    """Wrap the existing Mac C API product; certify bytes/ABI, never capacity."""
+    if destination.exists():
+        raise RuntimeError("Never replace a retained package")
+    source = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"):
+        raise RuntimeError("Package only committed source")
+    if run("lipo", "-archs", str(source_library)) != "arm64":
+        raise RuntimeError("Mac qualification requires exactly arm64, not a universal claim")
+    minimum = minimum_os_from_build(run("vtool", "-show-build", str(source_library)), "MACOS", supported_platforms=("MACOS",))
+    own_id = "@rpath/libCLiteRTLM_mac.dylib"
+    linked = dependencies(source_library)
+    if run("otool", "-D", str(source_library)).splitlines()[1:] != [own_id]:
+        raise RuntimeError("Unexpected Mac C API install name")
+    # An unexpected non-system dependency is a packaging failure. Do not ship
+    # a partial dynamic runtime, omit a dependency, or silently switch linkage.
+    validate_dependencies("CLiteRTLM_mac", linked, {own_id})
+    expected = public_c_exports(ROOT / "c")
+    validate_public_c_exports(exported_symbols(source_library), expected)
+    with tempfile.TemporaryDirectory(prefix="litert-mac-arm64-package-") as temporary:
+        work = Path(temporary)
+        binary = work / "libCLiteRTLM_mac.dylib"
+        shutil.copy2(source_library, binary)
+        headers = work / "Headers"
+        headers.mkdir()
+        header_hashes = {}
+        for header in PUBLIC_C_HEADERS:
+            shutil.copy2(ROOT / "c" / header, headers / header)
+            header_hashes[header] = digest(headers / header)
+        module_map = 'module CLiteRTLM {\n' + ''.join(
+            f'  header "{header}"\n' for header in PUBLIC_C_HEADERS) + '  export *\n}\n'
+        (headers / "module.modulemap").write_text(module_map)
+        run("codesign", "--force", "--sign", "-", str(binary))
+        run("codesign", "--verify", "--strict", str(binary))
+        xcframework = work / "CLiteRTLM_mac.xcframework"
+        run("xcodebuild", "-create-xcframework", "-library", str(binary),
+            "-headers", str(headers), "-output", str(xcframework))
+        info = plistlib.loads((xcframework / "Info.plist").read_bytes())
+        entries = info.get("AvailableLibraries", [])
+        if len(entries) != 1:
+            raise RuntimeError("Mac qualification requires exactly one library slice")
+        entry = entries[0]
+        if (entry.get("LibraryIdentifier") != "macos-arm64" or
+                entry.get("SupportedPlatform") != "macos" or
+                entry.get("SupportedArchitectures") != ["arm64"] or
+                "SupportedPlatformVariant" in entry or
+                entry.get("LibraryPath") != binary.name or
+                entry.get("HeadersPath") != "Headers"):
+            raise RuntimeError("Incorrect declared Mac arm64 slice")
+        library = xcframework / "macos-arm64" / binary.name
+        copied_headers = library.parent / "Headers"
+        if digest(library) != digest(binary):
+            raise RuntimeError("XCFramework changed the signed Mac library")
+        for header in PUBLIC_C_HEADERS:
+            if digest(copied_headers / header) != header_hashes[header]:
+                raise RuntimeError("Mac public header differs from exact source")
+        if (copied_headers / "module.modulemap").read_text() != module_map:
+            raise RuntimeError("Mac module map changed")
+        if (run("lipo", "-archs", str(library)) != "arm64" or
+                minimum_os_from_build(run("vtool", "-show-build", str(library)), "MACOS", supported_platforms=("MACOS",)) != minimum or
+                dependencies(library) != linked):
+            raise RuntimeError("Mac packaged binary platform or dependencies changed")
+        validate_public_c_exports(exported_symbols(library), expected)
+        run("codesign", "--verify", "--strict", str(library))
+        run("codesign", "--force", "--sign", "-", str(xcframework))
+        run("codesign", "--verify", "--strict", str(xcframework))
+        destination.mkdir()
+        archive = destination / "CLiteRTLM_mac.xcframework.zip"
+        zip_directory(xcframework, archive)
+        report = {
+            "source": source, "platform": "MACOS", "architectures": ["arm64"],
+            "minimumOS": minimum, "sourceLibrarySHA256": digest(source_library),
+            "binarySHA256": digest(library), "dependencies": linked,
+            "publicHeaderSHA256": header_hashes,
+            "publicCExports": sorted(expected),
+            "archiveSHA256": digest(archive), "modelQueries": 0,
+            "macAppAcceptance": False, "canonicalProcessingQualification": False,
+            "capacityQualification": False,
+        }
+        (destination / "SOURCE_COMMIT").write_text(source + "\n")
+        (destination / "SHA256SUMS").write_text(f'{digest(archive)}  {archive.name}\n')
+        (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_archive", type=Path)
     parser.add_argument("destination", type=Path)
+    parser.add_argument("--macos-arm64", action="store_true",
+                        help="Package an existing same-source Mac arm64 C API dylib")
     arguments = parser.parse_args()
-    package(arguments.source_archive, arguments.destination)
+    if arguments.macos_arm64:
+        package_macos_arm64(arguments.source_archive, arguments.destination)
+    else:
+        package(arguments.source_archive, arguments.destination)

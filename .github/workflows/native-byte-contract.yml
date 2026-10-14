@@ -21,6 +21,10 @@ on:
         description: Run every native host gate and skip framework build/package
         default: false
         type: boolean
+      mac_arm64_only:
+        description: Package same-source macOS arm64 qualification artifact instead of iOS
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -149,7 +153,7 @@ jobs:
             cp -RL bazel-testlogs native-test-results
           fi
       - name: Build device and simulator framework
-        if: ${{ !inputs.host_only }}
+        if: ${{ !inputs.host_only && !inputs.mac_arm64_only }}
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
@@ -158,11 +162,27 @@ jobs:
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             //swift:CLiteRTLM 2>&1 | tee native-framework.log
       - name: Package and verify the Apple runtime dependency graph
-        if: ${{ !inputs.host_only }}
+        if: ${{ !inputs.host_only && !inputs.mac_arm64_only }}
         run: |
           set -o pipefail
           python3 tools/package_apple_runtime.py bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact \
             2>&1 | tee native-package.log
+      - name: Build same-source Mac arm64 qualification library
+        if: ${{ !inputs.host_only && inputs.mac_arm64_only }}
+        run: |
+          set -o pipefail
+          # Keep the existing Mac default linkage, not the iOS dynamic override.
+          "$RUNNER_TEMP/bazelisk" build --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s --local_ram_resources=4096 \
+            //swift:CLiteRTLM_mac_arm64_input 2>&1 | tee native-mac-arm64-build.log
+      - name: Package and verify Mac arm64 qualification artifact
+        if: ${{ !inputs.host_only && inputs.mac_arm64_only }}
+        run: |
+          set -o pipefail
+          python3 tools/package_apple_runtime.py --macos-arm64 \
+            bazel-bin/swift/mac-arm64-input/libCLiteRTLM_mac.dylib native-mac-arm64-artifact \
+            2>&1 | tee native-mac-arm64-package.log
       - name: Retain native evidence and framework
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -179,6 +199,9 @@ jobs:
             native-package.log
             native-artifact/
             native-artifact-failure/
+            native-mac-arm64-build.log
+            native-mac-arm64-package.log
+            native-mac-arm64-artifact/
             bazel-bin/swift/CLiteRTLM.xcframework.zip
             native-test-results/
           if-no-files-found: warn

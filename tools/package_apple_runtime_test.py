@@ -447,5 +447,59 @@ class ApplePublicCExportTests(unittest.TestCase):
                     self.assertEqual({row['name'] for row in result}, set(frameworks))
 
 
+class MacArm64PackageBoundaryTests(unittest.TestCase):
+    def native(self, *args):
+        if args[0] == 'git':
+            return '' if '--porcelain' in args else 'source-fixture'
+        if args[:2] == ('lipo', '-archs'):
+            return 'arm64'
+        if args[:2] == ('vtool', '-show-build'):
+            return build_version_fixture('MACOS', '12.0')
+        if args[:2] == ('otool', '-D'):
+            return args[2] + ':\n@rpath/libCLiteRTLM_mac.dylib'
+        self.fail('Unexpected native command in pure boundary control: ' + repr(args))
+
+    def testMacPlatformRequiresExplicitOptInWithoutChangingIOSDefault(self):
+        value = build_version_fixture('MACOS', '12.0')
+        self.assertEqual(minimum_os_from_build(value, 'MACOS', supported_platforms=('MACOS',)), '12.0')
+        with self.assertRaisesRegex(RuntimeError, 'Unsupported Apple runtime platform'):
+            minimum_os_from_build(value, 'MACOS')
+        with self.assertRaisesRegex(RuntimeError, 'Wrong/ambiguous Mach-O platform'):
+            minimum_os_from_build(build_version_fixture('IOS'), 'MACOS', supported_platforms=('MACOS',))
+
+    def testMacUniversalAndIntelCannotBecomeArm64Qualification(self):
+        from package_apple_runtime import package_macos_arm64
+        with tempfile.TemporaryDirectory() as temporary:
+            for architecture in ('x86_64', 'arm64 x86_64'):
+                def native(*args):
+                    return architecture if args[:2] == ('lipo', '-archs') else self.native(*args)
+                with self.subTest(architecture=architecture), patch('package_apple_runtime.run', side_effect=native):
+                    with self.assertRaisesRegex(RuntimeError, 'exactly arm64'):
+                        package_macos_arm64(Path('fixture-library'), Path(temporary) / 'output')
+
+    def testMacUnexpectedRuntimeClosureRefusesBeforeAnyPackageIsCreated(self):
+        from package_apple_runtime import package_macos_arm64
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('package_apple_runtime.run', side_effect=self.native), \
+                patch('package_apple_runtime.dependencies', return_value=[
+                    '@rpath/libCLiteRTLM_mac.dylib', '@rpath/libLiteRt.dylib']):
+            output = Path(temporary) / 'output'
+            with self.assertRaisesRegex(RuntimeError, 'Unpackaged dependencies'):
+                package_macos_arm64(Path('fixture-library'), output)
+            self.assertFalse(output.exists())
+
+    def testMacMissingCanonicalExportCannotReachSigningOrAcceptance(self):
+        from package_apple_runtime import ROOT, public_c_exports, package_macos_arm64
+        exports = public_c_exports(ROOT / 'c') - {'litert_lm_engine_count_first_input_text_tokens'}
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('package_apple_runtime.run', side_effect=self.native), \
+                patch('package_apple_runtime.dependencies', return_value=['@rpath/libCLiteRTLM_mac.dylib']), \
+                patch('package_apple_runtime.exported_symbols', return_value=exports):
+            output = Path(temporary) / 'output'
+            with self.assertRaisesRegex(RuntimeError, 'Missing public C API exports'):
+                package_macos_arm64(Path('fixture-library'), output)
+            self.assertFalse(output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
