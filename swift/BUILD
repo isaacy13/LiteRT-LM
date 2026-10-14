@@ -168,6 +168,16 @@ macos_dylib(
     deps = [":CLiteRTLM_objc"],
 )
 
+# Qualification input only: architecture is enforced again by the packager.
+# This does not change the existing universal or iOS products.
+genrule(
+    name = "CLiteRTLM_mac_arm64_input",
+    srcs = [":CLiteRTLM_dylib"],
+    outs = ["mac-arm64-input/libCLiteRTLM_mac.dylib"],
+    cmd = "cp $(location :CLiteRTLM_dylib) $@",
+    visibility = ["//visibility:public"],
+)
+
 apple_universal_binary(
     name = "CLiteRTLM_universal",
     binary = ":CLiteRTLM_dylib",

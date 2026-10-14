@@ -21,9 +21,9 @@ def output(*arguments: str) -> str:
     return subprocess.check_output(arguments, text=True).strip()
 
 
-def verify() -> list[dict[str, str]]:
+def verify(*, platforms=PLATFORMS) -> list[dict[str, str]]:
     results = []
-    for directory, platform in PLATFORMS.items():
+    for directory, platform in platforms.items():
         for name in LIBRARIES:
             path = ROOT / "prebuilt" / directory / name
             with path.open("rb") as binary:

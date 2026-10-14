@@ -60,6 +60,12 @@ config_setting(
     values = { "apple_platform_type": "ios", "cpu": "ios_sim_arm64",},
 )
 
+config_setting(
+    name = "macos_arm64_metal_runtime",
+    constraint_values = ["@platforms//os:macos", "@platforms//cpu:arm64"],
+    define_values = {"litert_lm_macos_metal_runtime": "1"},
+)
+
 alias(
     name = "patchelf_exe",
     actual = select({

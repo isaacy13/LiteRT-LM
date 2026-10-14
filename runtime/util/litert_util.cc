@@ -24,7 +24,7 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE || defined(LITERT_LM_MAC_METAL_RUNTIME)
 #include "litert/c/internal/litert_accelerator_def.h"  // from @litert
 extern "C" const LiteRtAcceleratorDef LiteRtAcceleratorImpl;
 #endif
@@ -49,7 +49,7 @@ namespace litert::lm {
 
 namespace {
 
-// Keep the accelerator definition owned by the linked iOS framework for the
+// Keep the accelerator definition owned by the linked Apple framework for the
 // environment lifetime. This is the pinned runtime's custom accelerator ABI;
 // app code does not receive a handle or configure internal runtime options.
 void AddAppleMetalAccelerator(
@@ -57,7 +57,7 @@ void AddAppleMetalAccelerator(
     const std::optional<VisionExecutorSettings>& vision_settings,
     const std::optional<AudioExecutorSettings>& audio_settings,
     std::vector<EnvironmentOptions::Option>& options) {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || defined(LITERT_LM_MAC_METAL_RUNTIME))
   if (backend == Backend::GPU ||
       (vision_settings.has_value() && vision_settings->GetBackend() == Backend::GPU) ||
       (audio_settings.has_value() && audio_settings->GetBackend() == Backend::GPU)) {

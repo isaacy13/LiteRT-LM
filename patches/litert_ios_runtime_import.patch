@@ -1,6 +1,6 @@
 --- a/litert/c/BUILD
 +++ b/litert/c/BUILD
-@@ -1016,8 +1016,28 @@
+@@ -1016,8 +1016,44 @@
      deps = [":litert_tflite_runtime_c_api_so_shim"],
  )
  
@@ -24,9 +24,26 @@
 +    }),
 +)
 +
++# Reuse the exact committed Mac runtime for the arm64 packaging candidate.
++# Other macOS architectures retain their existing source-built runtime.
++config_setting(
++    name = "litert_lm_macos_arm64",
++    values = {"cpu": "darwin_arm64"},
++    define_values = {"litert_lm_macos_metal_runtime": "1"},
++)
++
++filegroup(
++    name = "litert_lm_macos_runtime",
++    srcs = select({
++        ":litert_lm_macos_arm64": ["@litert_lm//prebuilt/macos_arm64:libLiteRt.dylib"],
++        "//conditions:default": [":litert_runtime_c_api_dylib"],
++    }),
++)
++
  SELECT_LITERT_RUNTIME_C_API_SHARED_LIB = select({
 -    "//litert:ios": [":litert_runtime_c_api_dylib"],
 +    "//litert:ios": [":litert_lm_ios_runtime"],
-     "//litert:macos": [":litert_runtime_c_api_dylib"],
+-    "//litert:macos": [":litert_runtime_c_api_dylib"],
++    "//litert:macos": [":litert_lm_macos_runtime"],
      "//litert:windows": [],
      # The Emscripten toolchain can't emit a shared library; wasm clients link
