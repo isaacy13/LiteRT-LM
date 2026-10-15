@@ -437,13 +437,13 @@ class ApplePublicCExportTests(unittest.TestCase):
                     platform = 'MACOS' if macos_arm64 else 'IOSSIMULATOR' if 'ios-arm64-simulator' in args[2] else 'IOS'
                     return build_version_fixture(platform)
                 if args[:2] == ('otool', '-D'):
-                    return args[2] + ':\n' + install_name(Path(args[2]).name, macos=macos_arm64)
+                    return args[2] + ':\n' + install_name(Path(args[2]).name)
                 if args[:3] == ('codesign', '--verify', '--strict'):
                     signatures.append(Path(args[3]))
                     return ''
                 self.fail('Unexpected native call ' + repr(args))
             def linked(binary):
-                return [install_name(binary.name, macos=macos_arm64), *([install_name(n, macos=macos_arm64) for n in LIBRARIES.values()]
+                return [install_name(binary.name), *([install_name(n) for n in LIBRARIES.values()]
                         if binary.name == 'CLiteRTLM' else [])]
             def symbols(binary):
                 result = set(exports[binary.name])
@@ -468,7 +468,7 @@ class ApplePublicCExportTests(unittest.TestCase):
                     self.assertEqual(len(signatures), expected_count)
                     self.assertEqual({row['name'] for row in result}, set(frameworks))
                     if macos_arm64:
-                        self.assertTrue(all(row['bundleLayout'] == 'Versions/A' and len(row['symbolicLinks']) == 5 for row in result))
+                        self.assertTrue(all(row['bundleLayout'] == 'Versions/A' and len(row['symbolicLinks']) == 5 and row['installID'] == install_name(row['name']) for row in result))
 
 
 class MacArm64DevelopmentPackageTests(unittest.TestCase):
@@ -613,7 +613,7 @@ class MacVersionedFrameworkTests(unittest.TestCase):
         from package_apple_runtime import zip_directory
         import zipfile
         self.assertEqual(install_name("CLiteRTLM"), "@rpath/CLiteRTLM.framework/CLiteRTLM")
-        self.assertEqual(install_name("CLiteRTLM", macos=True), "@rpath/CLiteRTLM.framework/Versions/A/CLiteRTLM")
+        self.assertNotIn("Versions/", install_name("CLiteRTLM"))
         with tempfile.TemporaryDirectory() as t:
             root = Path(t); directory = root / "IOS.xcframework"; directory.mkdir()
             (directory / "Info.plist").write_bytes(b"original-ios-metadata")
@@ -622,13 +622,21 @@ class MacVersionedFrameworkTests(unittest.TestCase):
                 self.assertEqual(z.namelist(), ["IOS.xcframework/Info.plist"])
                 self.assertEqual(z.read(z.namelist()[0]), b"original-ios-metadata")
 
-    def testMacRewritesRawAndAlreadyPackagedMatchingDependencies(self):
+    def testMacRewritesOnlyRawDependenciesAndPreservesExistingFrameworkPaths(self):
         from package_apple_runtime import MAC_LIBRARIES
         old = ["@rpath/libLiteRt.dylib", install_name("GemmaModelConstraintProvider"), install_name("WebGpuDawn")]
-        with patch("package_apple_runtime.dependencies", return_value=old), patch("package_apple_runtime.run") as native:
+        with patch("package_apple_runtime.dependencies", return_value=old), patch("package_apple_runtime.run", return_value="fixture:\n" + install_name("CLiteRTLM")) as native:
             rewrite_linkage(Path("fixture"), "CLiteRTLM", MAC_LIBRARIES, macos=True)
-        self.assertEqual(native.call_args_list[0].args[2], install_name("CLiteRTLM", macos=True))
-        self.assertEqual([x.args[3] for x in native.call_args_list[1:]], [install_name(n, macos=True) for n in ["LiteRtRuntime", "GemmaModelConstraintProvider", "WebGpuDawn"]])
+        self.assertEqual(native.call_args_list[0].args, ("otool", "-D", "fixture"))
+        self.assertEqual([x.args for x in native.call_args_list[1:]], [("install_name_tool", "-change", old[0], install_name("LiteRtRuntime"), "fixture")])
+
+    def testAlreadyPackagedMacIDsAndDependenciesNeverInvokeInstallNameTool(self):
+        from package_apple_runtime import MAC_LIBRARIES
+        for name in ["CLiteRTLM", *MAC_LIBRARIES.values()]:
+            with self.subTest(name=name), patch("package_apple_runtime.dependencies", return_value=[install_name(n) for n in MAC_LIBRARIES.values()]), patch("package_apple_runtime.run", return_value="fixture:\n" + install_name(name)) as native:
+                rewrite_linkage(Path("fixture"), name, MAC_LIBRARIES, macos=True)
+                native.assert_called_once_with("otool", "-D", "fixture")
+                self.assertEqual(install_name(name), "@rpath/" + name + ".framework/" + name)
 
     def testMacMetadataDeclaresBothMinimumKeysFromActualBuild(self):
         with patch("package_apple_runtime.run", return_value=build_version_fixture("MACOS", "14.0")):
@@ -676,7 +684,7 @@ class MacVersionedFrameworkTests(unittest.TestCase):
 class MacNativeContentPreservationTests(unittest.TestCase):
     def binary(self, *, versioned=False, corrupt=False, uuid=b"x" * 16):
         import struct
-        name = install_name("CLiteRTLM", macos=versioned).encode() + b"\0"
+        name = install_name("CLiteRTLM").encode() + b"\0"
         length = (24 + len(name) + 7) & ~7
         dylib = struct.pack("<6I", 0xd, length, 24, 0, 65536, 65536) + name
         dylib += b"\0" * (length - len(dylib))
@@ -691,7 +699,7 @@ class MacNativeContentPreservationTests(unittest.TestCase):
         if corrupt: data[513] ^= 1
         return bytes(data)
 
-    def testOnlyVersionedLinkageSignatureAllocationMayChange(self):
+    def testSigningAllocationMayChangeWithoutInstallNameGrowth(self):
         from package_apple_runtime import require_same_native_content
         self.assertEqual(len(require_same_native_content(self.binary(), self.binary(versioned=True), "CLiteRTLM")), 64)
 

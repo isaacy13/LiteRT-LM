@@ -180,8 +180,8 @@ def validate_public_c_exports(symbols, expected):
         raise RuntimeError("Missing public C API exports: " + repr(sorted(missing)))
 
 
-def install_name(name, *, macos=False):
-    return f"@rpath/{name}.framework/" + ("Versions/A/" if macos else "") + name
+def install_name(name):
+    return f"@rpath/{name}.framework/{name}"
 
 
 def dependencies(binary):
@@ -262,17 +262,14 @@ def rewrite_linkage(binary, name, libraries=LIBRARIES, *, macos=False):
     # Rewrite the signed copy, then replace its signature when the completed
     # framework is sealed. Early removal can leave signature-alignment padding
     # at the end of __LINKEDIT that older install_name_tool versions reject.
-    run("install_name_tool", "-id", install_name(name, macos=macos), str(binary))
+    # A standard root binary alias reaches Versions/Current. Already-packaged
+    # Mac inputs need no load-command growth or install-name mutation.
+    if not macos or run("otool", "-D", str(binary)).splitlines()[1:] != [install_name(name)]:
+        run("install_name_tool", "-id", install_name(name), str(binary))
     for dependency in dependencies(binary):
         old = dependency.removeprefix("@rpath/")
         if dependency.startswith("@rpath/") and old in libraries:
-            run("install_name_tool", "-change", dependency, install_name(libraries[old], macos=macos), str(binary))
-        elif macos:
-            names = [n for n in ["CLiteRTLM", *libraries.values()]
-                     if dependency == install_name(n)]
-            if names:
-                run("install_name_tool", "-change", dependency,
-                    install_name(names[0], macos=True), str(binary))
+            run("install_name_tool", "-change", dependency, install_name(libraries[old]), str(binary))
 
 
 def macos_links(name):
@@ -330,8 +327,8 @@ def native_content_identity(data, name):
     header = struct.unpack_from("<8I", data)
     count, size = header[4:6]
     offset = 32; commands = []; first_section = len(data); signature = None; linkedit = None
-    mapping = {install_name(n): install_name(n, macos=True) for n in ["CLiteRTLM", *MAC_LIBRARIES.values()]}
-    mapping.update({"@rpath/" + lib: install_name(n, macos=True) for lib, n in MAC_LIBRARIES.items()})
+    mapping = {install_name(n): install_name(n) for n in ["CLiteRTLM", *MAC_LIBRARIES.values()]}
+    mapping.update({"@rpath/" + lib: install_name(n) for lib, n in MAC_LIBRARIES.items()})
     for _ in range(count):
         command, length = struct.unpack_from("<II", data, offset)
         if length < 8 or offset + length > 32 + size or 32 + size > len(data):
@@ -346,7 +343,7 @@ def native_content_identity(data, name):
             if start != 24 or len(pieces) != 2 or any(pieces[1]):
                 raise RuntimeError("Unexpected native linkage command layout")
             linked = pieces[0].decode("utf-8")
-            linked = install_name(name, macos=True) if command == 0xd else mapping.get(linked, linked)
+            linked = install_name(name) if command == 0xd else mapping.get(linked, linked)
             commands.append((command, linked, struct.unpack_from("<III", raw, 12)))
         else:
             if command == 0x19:
@@ -485,7 +482,7 @@ def inspect(frameworks, *, macos_arm64=False):
             or set(GEMMA_ABI_OWNERS.values()) != {"CLiteRTLM", "GemmaModelConstraintProvider"}):
         raise RuntimeError("Invalid native tool constraint provider ABI ownership")
     results = []
-    allowed = {install_name(name, macos=macos_arm64) for name in frameworks}
+    allowed = {install_name(name) for name in frameworks}
     expected_c_exports = public_c_exports(ROOT / "c") if "CLiteRTLM" in frameworks else set()
     for identifier, (_, platform) in slices.items():
         for name, xcframework in frameworks.items():
@@ -512,11 +509,11 @@ def inspect(frameworks, *, macos_arm64=False):
                 raise RuntimeError("Incoherent Mac minimum OS metadata")
             linked = dependencies(binary)
             own_id = run("otool", "-D", str(binary)).splitlines()[1:]
-            if own_id != [install_name(name, macos=macos_arm64)]:
+            if own_id != [install_name(name)]:
                 raise RuntimeError(f"Incorrect install name at {binary}: {own_id}")
             validate_dependencies("CLiteRTLM_mac" if macos_arm64 and name == "CLiteRTLM" else name, linked, allowed)
             if macos_arm64 and name == "CLiteRTLM":
-                required = {install_name(n, macos=True) for n in ("LiteRtRuntime", "GemmaModelConstraintProvider")}
+                required = {install_name(n) for n in ("LiteRtRuntime", "GemmaModelConstraintProvider")}
                 if not required <= set(linked):
                     raise RuntimeError("Mac core must strongly link its matching runtime and Gemma provider")
             symbols = exported_symbols(binary)
@@ -542,7 +539,7 @@ def inspect(frameworks, *, macos_arm64=False):
                             "sha256": digest(binary), "dependencies": linked,
                             "minimumOS": minimum, "frameworkMinimumOSVersion": metadata["MinimumOSVersion"],
                             "requiredGemmaABIExports": sorted(required_gemma_exports),
-                            **({"definedExports": sorted(symbols), "bundleLayout": "Versions/A",
+                            **({"definedExports": sorted(symbols), "bundleLayout": "Versions/A", "installID": own_id[0],
                                 "symbolicLinks": links} if macos_arm64 else {})})
     return results
 
