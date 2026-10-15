@@ -767,16 +767,240 @@ def repackage_macos_arm64(artifact, destination):
         print(json.dumps(report, indent=2))
 
 
+ASSEMBLY_IOS_SOURCE = "20fe6897c60547bbad0821f738d675f15e65b298"
+ASSEMBLY_COMMON = {"CLiteRTLM", *LIBRARIES.values()}
+ASSEMBLY_MAC_NAMES = {"CLiteRTLM", *MAC_LIBRARIES.values()}
+
+
+def validate_assembly_manifest(manifest, *, macos, compiled_source, packaging_revision):
+    """Admit only the two previously built compiler cohorts, not arbitrary SDKs."""
+    expected = ASSEMBLY_MAC_NAMES if macos else ASSEMBLY_COMMON
+    slices = MAC_SLICES if macos else SLICES
+    compiled = manifest.get("compiledSource", manifest.get("source"))
+    if (not isinstance(compiled_source, str) or re.fullmatch(r"[0-9a-f]{40}", compiled_source) is None
+            or not isinstance(packaging_revision, str) or re.fullmatch(r"[0-9a-f]{40}", packaging_revision) is None
+            or compiled != compiled_source or manifest.get("source") != compiled
+            or manifest.get("packagingRevision", compiled) != packaging_revision
+            or manifest.get("gemmaABIExportOwners") != GEMMA_ABI_OWNERS
+            or manifest.get("packagedDependencyClosure") is not True):
+        raise RuntimeError("Unreviewed assembly compiler/provenance/ABI cohort")
+    archives = manifest.get("archives")
+    if not isinstance(archives, dict) or set(archives) != expected:
+        raise RuntimeError("Incomplete assembly archive closure")
+    for name, row in archives.items():
+        filename = ("CLiteRTLM_mac" if macos and name == "CLiteRTLM" else name) + ".xcframework.zip"
+        if (not isinstance(row, dict) or row.get("file") != filename
+                or not isinstance(row.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                or ("bytes" in row and (type(row["bytes"]) is not int or row["bytes"] <= 0))):
+            raise RuntimeError("Invalid assembly archive binding")
+    rows = manifest.get("frameworks")
+    if not isinstance(rows, list) or len(rows) != len(expected) * len(slices):
+        raise RuntimeError("Incomplete assembly slice closure")
+    observed = set()
+    for row in rows:
+        if not isinstance(row, dict): raise RuntimeError("Invalid assembly slice row")
+        key = (row.get("name"), row.get("slice"))
+        if key in observed or key[0] not in expected or key[1] not in slices:
+            raise RuntimeError("Unexpected/duplicate assembly slice")
+        observed.add(key)
+        if (row.get("platform") != slices[key[1]][1]
+                or not isinstance(row.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                or set(row.get("requiredGemmaABIExports", [])) !=
+                   {symbol for symbol, owner in GEMMA_ABI_OWNERS.items() if owner == key[0]}):
+            raise RuntimeError("Invalid assembly platform/native ABI row")
+    return expected
+
+
+def assembly_upstream_release(compiler_sources):
+    """The compiler sources may differ; their official release ancestry may not."""
+    current = json.loads((ROOT / "UPSTREAM_RELEASE.json").read_bytes())
+    expected = {"tag": current.get("tag"), "commit": current.get("commit")}
+    if (expected["tag"] != "v0.18.0" or not isinstance(expected["commit"], str)
+            or re.fullmatch(r"[0-9a-f]{40}", expected["commit"]) is None):
+        raise RuntimeError("Missing explicit upstream release ancestry")
+    for source in compiler_sources:
+        original = json.loads(run("git", "-C", str(ROOT), "show", source + ":UPSTREAM_RELEASE.json"))
+        if {"tag": original.get("tag"), "commit": original.get("commit")} != expected:
+            raise RuntimeError("Assembly compiler upstream releases differ")
+    return expected
+
+
+def assembly_tree_identity(directory):
+    return {p.relative_to(directory).as_posix(): {"link": p.readlink().as_posix()} if p.is_symlink()
+            else {"sha256": digest(p), "bytes": p.stat().st_size}
+            for p in directory.rglob("*") if p.is_symlink() or p.is_file()}
+
+
+def validate_assembly_layout(xcframework, name, identifiers):
+    info = plistlib.loads((xcframework / "Info.plist").read_bytes())
+    if (set(info) != {"AvailableLibraries", "CFBundlePackageType", "XCFrameworkFormatVersion"}
+            or info["CFBundlePackageType"] != "XFWK" or info["XCFrameworkFormatVersion"] != "1.0"
+            or {p.name for p in xcframework.iterdir()} != {"Info.plist", *identifiers}):
+        raise RuntimeError("Invalid assembly XCFramework membership")
+    entries = info["AvailableLibraries"]
+    if (not isinstance(entries, list) or len(entries) != len(identifiers)
+            or {row.get("LibraryIdentifier") for row in entries} != set(identifiers)):
+        raise RuntimeError("Incorrect assembly declared slices")
+    for row in entries:
+        identifier = row["LibraryIdentifier"]
+        platform = "macos" if identifier == "macos-arm64" else "ios"
+        variant = "simulator" if identifier == "ios-arm64-simulator" else None
+        if (row.get("SupportedArchitectures") != ["arm64"] or row.get("SupportedPlatform") != platform
+                or row.get("SupportedPlatformVariant") != variant or row.get("LibraryPath") != name + ".framework"):
+            raise RuntimeError("Incorrect assembly architecture/platform declaration")
+        slice_root = xcframework / identifier
+        if slice_root.is_symlink() or {p.name for p in slice_root.iterdir()} != {name + ".framework"}:
+            raise RuntimeError("Unexpected assembly slice payload")
+        framework = slice_root / (name + ".framework")
+        modulemap = (framework / "Modules/module.modulemap").read_text()
+        if re.findall(r"(?m)^\s*(?:framework\s+)?module\s+(\w+)\b", modulemap) != [name]:
+            raise RuntimeError("Incoherent assembly C/Swift module name")
+        if identifier == "macos-arm64": validate_macos_layout(framework, name)
+    return info
+
+
+def verify_assembly_zip(archive, directory, name):
+    """Verify ZIP bytes/links without a second large extraction or unsafe writes."""
+    prefix = name + ".xcframework/"
+    actual = {}
+    with zipfile.ZipFile(archive) as bundle:
+        for row in bundle.infolist():
+            relative = row.filename.removeprefix(prefix)
+            if (not row.filename.startswith(prefix) or not relative or row.is_dir()
+                    or Path(relative).is_absolute() or any(p in {"", ".", ".."} for p in relative.split("/"))
+                    or "\\" in relative or relative in actual):
+                raise RuntimeError("Unsafe/duplicate assembly ZIP member")
+            mode = row.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                actual[relative] = {"link": bundle.read(row).decode("utf-8")}
+            elif stat.S_IFMT(mode) in {0, stat.S_IFREG}:
+                with bundle.open(row) as member:
+                    hashed = hashlib.sha256()
+                    for chunk in iter(lambda: member.read(1024 * 1024), b""): hashed.update(chunk)
+                    actual[relative] = {"sha256": hashed.hexdigest(), "bytes": row.file_size}
+            else: raise RuntimeError("Unsupported assembly ZIP member")
+    if actual != assembly_tree_identity(directory):
+        raise RuntimeError("Assembly ZIP changed framework bytes or links")
+
+
+def assemble_apple_artifacts(ios_artifact, macos_artifact, destination, ios_manifest_sha, macos_manifest_sha,
+                             macos_compiled_source, macos_packaging_revision):
+    """Join accepted slices; never compile, rewrite install names or re-sign."""
+    if destination.exists() or destination.is_symlink(): raise RuntimeError("Never replace a retained assembly")
+    paths = {"ios": ios_artifact / "APPLE_RUNTIME_MANIFEST.json", "macos": macos_artifact / "APPLE_RUNTIME_MANIFEST.json"}
+    expected = {"ios": ios_manifest_sha, "macos": macos_manifest_sha}
+    manifests = {}; archives = {}
+    for platform, path in paths.items():
+        if (not isinstance(expected[platform], str) or re.fullmatch(r"[0-9a-f]{64}", expected[platform]) is None
+                or path.parent.is_symlink() or path.is_symlink() or digest(path) != expected[platform]):
+            raise RuntimeError("Assembly input manifest binding changed")
+        manifest = json.loads(path.read_bytes()); manifests[platform] = manifest
+        validate_assembly_manifest(manifest, macos=platform == "macos",
+            compiled_source=macos_compiled_source if platform == "macos" else ASSEMBLY_IOS_SOURCE,
+            packaging_revision=macos_packaging_revision if platform == "macos" else ASSEMBLY_IOS_SOURCE)
+        for name, row in manifest["archives"].items():
+            archive = path.parent / row["file"]
+            if (archive.is_symlink() or not archive.is_file() or digest(archive) != row["sha256"]
+                    or ("bytes" in row and archive.stat().st_size != row["bytes"])):
+                raise RuntimeError("Assembly source archive changed: " + name)
+            archives[(platform, name)] = archive
+    revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    if (re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            or run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no")):
+        raise RuntimeError("Assemble only committed source")
+    upstream = assembly_upstream_release([ASSEMBLY_IOS_SOURCE, macos_compiled_source])
+    with retained_package_work(paths["ios"], destination, revision, preserve_symlinks=True) as work:
+        (work / "ASSEMBLY_INPUTS.json").write_text(json.dumps({k: {"manifestSHA256": expected[k],
+            "compiledSource": manifests[k]["source"]} for k in paths}, indent=2) + "\n")
+        extracted = {key: extract_macos_archive(path, work / key[0], key[1], versioned=key[0] == "macos")
+                     for key, path in archives.items()}
+        for (platform, name), directory in extracted.items():
+            validate_assembly_layout(directory, name, MAC_SLICES if platform == "macos" else SLICES)
+        ios = inspect({name: extracted[("ios", name)] for name in ASSEMBLY_COMMON})
+        macos = inspect({name: extracted[("macos", name)] for name in ASSEMBLY_MAC_NAMES}, macos_arm64=True)
+        for platform, rows in [("ios", ios), ("macos", macos)]:
+            originals = {(row["name"], row["slice"]): row for row in manifests[platform]["frameworks"]}
+            for row in rows:
+                original = originals[(row["name"], row["slice"])]
+                for field in ["sha256", "dependencies", "minimumOS", "frameworkMinimumOSVersion", "requiredGemmaABIExports"]:
+                    if row[field] != original[field]: raise RuntimeError("Assembly readback differs: " + field)
+                if row["name"] == "CLiteRTLM":
+                    binary = extracted[(platform, "CLiteRTLM")] / row["slice"] / "CLiteRTLM.framework/CLiteRTLM"
+                    row["definedExports"] = sorted(exported_symbols(binary))
+        combined = {}; output_rows = ios + macos
+        for name in sorted(ASSEMBLY_MAC_NAMES):
+            identifiers = [*SLICES, *MAC_SLICES] if name in ASSEMBLY_COMMON else list(MAC_SLICES)
+            target = work / "assembled" / (name + ".xcframework"); target.mkdir(parents=True)
+            entries = []
+            for platform in (["ios", "macos"] if name in ASSEMBLY_COMMON else ["macos"]):
+                original = extracted[(platform, name)]
+                info = validate_assembly_layout(original, name, MAC_SLICES if platform == "macos" else SLICES)
+                for entry in info["AvailableLibraries"]:
+                    identifier = entry["LibraryIdentifier"]
+                    shutil.copytree(original / identifier, target / identifier, symlinks=True)
+                    if assembly_tree_identity(original / identifier) != assembly_tree_identity(target / identifier):
+                        raise RuntimeError("Assembly altered an original native slice")
+                    entries.append(entry)
+            (target / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": entries,
+                "CFBundlePackageType": "XFWK", "XCFrameworkFormatVersion": "1.0"}))
+            validate_assembly_layout(target, name, identifiers); combined[name] = target
+        destination.mkdir(); output_archives = {}
+        for name, directory in combined.items():
+            archive = destination / (name + ".xcframework.zip")
+            zip_directory(directory, archive, macos=True); verify_assembly_zip(archive, directory, name)
+            output_archives[name] = {"file": archive.name, "sha256": digest(archive), "bytes": archive.stat().st_size,
+                "slices": [*SLICES, *MAC_SLICES] if name in ASSEMBLY_COMMON else list(MAC_SLICES)}
+        if any(digest(path) != expected[platform] for platform, path in paths.items()) or any(
+                digest(path) != manifests[platform]["archives"][name]["sha256"] for (platform, name), path in archives.items()):
+            raise RuntimeError("Assembly inputs changed during packaging")
+        provenance = {identifier: {"compiledSource": manifests[platform]["source"],
+            "packagingRevision": manifests[platform].get("packagingRevision", manifests[platform]["source"]),
+            "inputManifestSHA256": expected[platform]}
+            for platform, identifiers in [("ios", SLICES), ("macos", MAC_SLICES)] for identifier in identifiers}
+        report = {"formatVersion": 2, "kind": "apple-runtime-assembly", "source": revision,
+            "upstreamRelease": upstream, "platformProvenance": provenance,
+            "compilerOutputRebuilt": False, "nativeSliceBytesUnchanged": True,
+            "packagedDependencyClosure": True, "architectures": ["arm64"], "intelQualified": False,
+            "modelQueries": 0, "phoneAcceptance": False, "appAcceptance": False, "modelAcceptance": False,
+            "gpuRegistrationQualified": False, "frameworks": output_rows, "archives": output_archives,
+            "gemmaABIExportOwners": GEMMA_ABI_OWNERS}
+        encoded_report = json.dumps(report, indent=2) + "\n"
+        if len(encoded_report.encode("utf-8")) > 8 * 1024 * 1024:
+            raise RuntimeError("Assembly publication manifest exceeds8MiB; never truncate native evidence")
+        (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(encoded_report)
+        (destination / "SOURCE_COMMIT").write_text(revision + "\n")
+        (destination / "SHA256SUMS").write_text("".join(f'{row["sha256"]}  {row["file"]}\n' for row in output_archives.values()))
+        print(json.dumps(report, indent=2))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--macos-arm64", action="store_true", help="Source-built arm64 development SDK; input is cquery output file list")
     parser.add_argument("--repackage-macos-artifact", action="store_true", help="Repackage the exact796b compiled whole SDK as versioned Mac frameworks; no compiler")
+    parser.add_argument("--assemble-apple-artifacts", action="store_true", help="Assemble exact accepted iOS and Mac slices without rebuilding native code")
+    parser.add_argument("--macos-artifact", type=Path)
+    parser.add_argument("--ios-manifest-sha256")
+    parser.add_argument("--macos-manifest-sha256")
+    parser.add_argument("--macos-compiled-source")
+    parser.add_argument("--macos-packaging-revision")
     parser.add_argument("source_archive", type=Path)
     parser.add_argument("destination", type=Path)
     arguments = parser.parse_args()
-    if arguments.macos_arm64 and arguments.repackage_macos_artifact:
-        parser.error("Select full Mac build packaging or exact artifact repackaging")
-    if arguments.repackage_macos_artifact:
+    if sum([arguments.macos_arm64, arguments.repackage_macos_artifact, arguments.assemble_apple_artifacts]) > 1:
+        parser.error("Select only one Apple packaging mode")
+    if arguments.assemble_apple_artifacts:
+        if not all([arguments.macos_artifact, arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+                    arguments.macos_compiled_source, arguments.macos_packaging_revision]):
+            parser.error("Assembly requires explicit Mac input and both exact manifest hashes")
+        assemble_apple_artifacts(arguments.source_archive, arguments.macos_artifact, arguments.destination,
+                                 arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+                                 arguments.macos_compiled_source, arguments.macos_packaging_revision)
+    elif any([arguments.macos_artifact, arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+              arguments.macos_compiled_source, arguments.macos_packaging_revision]):
+        parser.error("Assembly input bindings require explicit assembly mode")
+    elif arguments.repackage_macos_artifact:
         repackage_macos_arm64(arguments.source_archive, arguments.destination)
     elif arguments.macos_arm64:
         package_macos_arm64(arguments.source_archive, arguments.destination)
