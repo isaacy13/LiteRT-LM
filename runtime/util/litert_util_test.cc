@@ -35,6 +35,10 @@
 #include "litert/cc/litert_environment_options.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__arm64__)
+#include "litert/cc/litert_compiled_model.h"  // from @litert
+#include "litert/test/common.h"  // from @litert
+#endif
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler_factory.h"
 #include "runtime/components/top_p_cpu_sampler.h"
@@ -50,9 +54,9 @@ namespace litert::lm {
 namespace {
 
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__arm64__)
-// Environment/sampler bootstrap needs no model or external weights. A CPU-created
-// settings value avoids the GPU model-format probe; only its requested backend
-// changes before calling the SAME production CreateEnvironment overload.
+// No LLM weights are required. CPU-created settings avoid the LLM model-format
+// probe; the GPU arm compiles LiteRT's existing tiny add-model fixture to create
+// the real Metal device, as production model compilation does before sampling.
 TEST(LiteRtUtilTest, MacGenerationRegistersLinkedMetalAndCreatesGpuSampler) {
   for (Backend backend : {Backend::CPU, Backend::GPU}) {
     ASSERT_OK_AND_ASSIGN(auto assets,
@@ -67,8 +71,23 @@ TEST(LiteRtUtilTest, MacGenerationRegistersLinkedMetalAndCreatesGpuSampler) {
                   .HasValue(), backend == Backend::GPU);
     auto available = owned.env.GetAvailableAccelerators();
     ASSERT_TRUE(available.HasValue());
+    // Registration alone does not create a Metal device. Keep the compiled model
+    // alive through sampler destruction, matching the production lifetime/order.
+    std::optional<litert::CompiledModel> compiled_model;
     if (backend == Backend::GPU) {
       EXPECT_THAT(*available, ::testing::Contains(litert::HwAccelerators::kGpu));
+      auto compiled = litert::CompiledModel::Create(
+          owned.env,
+          litert::testing::GetLiteRtPath("test/testdata/simple_model.tflite"),
+          litert::HwAccelerators::kGpu);
+      ASSERT_TRUE(compiled.HasValue());
+      compiled_model.emplace(std::move(compiled.Value()));
+      auto initialized_options = owned.env.GetOptions();
+      ASSERT_TRUE(initialized_options.HasValue());
+      ASSERT_TRUE(initialized_options->GetOption(
+          EnvironmentOptions::Tag::kMetalDevice).HasValue());
+      ASSERT_FALSE(initialized_options->GetOption(
+          EnvironmentOptions::Tag::kWebGpuDevice).HasValue());
     }
     proto::SamplerParameters params;
     params.set_type(proto::SamplerParameters::TOP_P);

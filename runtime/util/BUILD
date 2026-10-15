@@ -549,7 +549,14 @@ cc_test(
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
         "//runtime/proto:sampler_params_cc_proto",
-    ],
+    ] + select({
+        "//runtime/components:macos_arm64": [
+            "@litert//litert/cc:litert_compiled_model",
+            "@litert//litert/test:common",
+            "@litert//litert/test:simple_model",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
