@@ -167,8 +167,8 @@ extern "C" int (*LiteRtTopKMetalSampler_SetInferenceFuncAndInputTensors_Static)(
     LiteRtTensorBuffer absl_nullable prev_param_tensor,
     LiteRtTensorBuffer absl_nullable param_tensor, char** error_msg) = nullptr;
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-// iOS embeds these APIs as a declared framework dependency. Bind them through
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || (TARGET_OS_OSX && defined(__arm64__)))
+// iOS and Mac arm64 embed these APIs as declared framework dependencies. Bind through
 // the linker instead of searching for standalone dylibs at runtime.
 extern "C" int LiteRtTopKMetalSampler_Create(
     const struct LiteRtRuntimeCApiStruct*, LiteRtEnvironment, int, int, int,
@@ -574,7 +574,7 @@ class TopKMetalCApiSampler : public TopKCApiSampler {
       const litert::Environment& env, int batch_size, int sequence_size,
       int vocab_size, std::optional<ActivationDataType> activation_data_type,
       proto::SamplerParameters sampler_params) {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(__APPLE__) && (TARGET_OS_IPHONE || (TARGET_OS_OSX && defined(__arm64__)))
     auto capi = std::make_unique<TopKSamplerCApi>(
         /*lib=*/std::nullopt, LiteRtTopKMetalSampler_Create,
         LiteRtTopKMetalSampler_Destroy,

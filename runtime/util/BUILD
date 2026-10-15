@@ -542,10 +542,13 @@ cc_test(
         "@litert//litert/cc:litert_macros",
         "@litert//litert/cc:litert_model",
         "//runtime/components:model_resources",
+        "//runtime/components:sampler_factory",
+        "//runtime/components:top_p_cpu_sampler",
         "//runtime/engine:embedding_engine_settings",
         "//runtime/engine:engine_settings",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
+        "//runtime/proto:sampler_params_cc_proto",
     ],
 )
 

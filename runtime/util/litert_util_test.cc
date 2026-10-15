@@ -22,6 +22,10 @@
 #include <string>
 #include <utility>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
@@ -32,15 +36,73 @@
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
 #include "runtime/components/model_resources.h"
+#include "runtime/components/sampler_factory.h"
+#include "runtime/components/top_p_cpu_sampler.h"
 #include "runtime/engine/embedding_engine_settings.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
 namespace litert::lm {
 namespace {
+
+#if defined(__APPLE__) && TARGET_OS_OSX && defined(__arm64__)
+// Environment/sampler bootstrap needs no model or external weights. A CPU-created
+// settings value avoids the GPU model-format probe; only its requested backend
+// changes before calling the SAME production CreateEnvironment overload.
+TEST(LiteRtUtilTest, MacGenerationRegistersLinkedMetalAndCreatesGpuSampler) {
+  for (Backend backend : {Backend::CPU, Backend::GPU}) {
+    ASSERT_OK_AND_ASSIGN(auto assets,
+                         ModelAssets::Create("bootstrap-no-model.litertlm"));
+    ASSERT_OK_AND_ASSIGN(auto settings,
+                         EngineSettings::CreateDefault(assets, Backend::CPU));
+    ASSERT_OK(settings.GetMutableMainExecutorSettings().SetBackend(backend));
+    ASSERT_OK_AND_ASSIGN(auto owned, CreateEnvironment(settings, nullptr));
+    auto options = owned.env.GetOptions();
+    ASSERT_TRUE(options.HasValue());
+    EXPECT_EQ(options->GetOption(EnvironmentOptions::Tag::kSystemGpuAcceleratorHandle)
+                  .HasValue(), backend == Backend::GPU);
+    auto available = owned.env.GetAvailableAccelerators();
+    ASSERT_TRUE(available.HasValue());
+    if (backend == Backend::GPU) {
+      EXPECT_THAT(*available, ::testing::Contains(litert::HwAccelerators::kGpu));
+    }
+    proto::SamplerParameters params;
+    params.set_type(proto::SamplerParameters::TOP_P);
+    params.set_k(1); params.set_p(1.0); params.set_temperature(0.0);
+    params.set_seed(0);
+    ASSERT_OK_AND_ASSIGN(auto sampler,
+        CreateSampler(backend, 1, params, std::cref(owned.env), 1, 32));
+    ASSERT_NE(sampler, nullptr);
+    // A successful CPU fallback is not evidence that the linked GPU sampler ran.
+    EXPECT_EQ(dynamic_cast<TopPSampler*>(sampler.get()) == nullptr,
+              backend == Backend::GPU);
+  }
+}
+
+TEST(LiteRtUtilTest, MacEmbeddingRegistersLinkedMetalOnlyWhenRequested) {
+  for (Backend backend : {Backend::CPU, Backend::GPU}) {
+    ASSERT_OK_AND_ASSIGN(auto assets,
+                         ModelAssets::Create("bootstrap-no-model.litertlm"));
+    ASSERT_OK_AND_ASSIGN(auto settings,
+        EmbeddingEngineSettings::CreateDefault(assets, Backend::CPU));
+    ASSERT_OK(settings.GetMutableMainExecutorSettings().SetBackend(backend));
+    ASSERT_OK_AND_ASSIGN(auto owned, CreateEnvironment(settings, nullptr));
+    auto options = owned.env.GetOptions();
+    ASSERT_TRUE(options.HasValue());
+    EXPECT_EQ(options->GetOption(EnvironmentOptions::Tag::kSystemGpuAcceleratorHandle)
+                  .HasValue(), backend == Backend::GPU);
+    if (backend == Backend::GPU) {
+      auto available = owned.env.GetAvailableAccelerators();
+      ASSERT_TRUE(available.HasValue());
+      EXPECT_THAT(*available, ::testing::Contains(litert::HwAccelerators::kGpu));
+    }
+  }
+}
+#endif
 
 class FakeModelResources : public ModelResources {
  public:
