@@ -21,6 +21,13 @@ on:
         description: Build an arm64-only development SDK after all host gates (official universal default unchanged)
         default: false
         type: boolean
+      assemble_apple_only:
+        description: Assemble accepted iOS and explicitly bound Mac arm64 archives into one draft release, without compiling
+        default: false
+        type: boolean
+      assembly_inputs:
+        description: 'Closed JSON: IOS_RELEASE, MAC_RELEASE, IOS_MANIFEST_SHA256, MAC_MANIFEST_SHA256, MAC_COMPILED_SOURCE, MAC_PACKAGING_REVISION, ASSEMBLY_RELEASE'
+        type: string
       host_only:
         description: Run every native host gate and skip framework build/package
         default: false
@@ -35,7 +42,7 @@ concurrency:
 
 jobs:
   native:
-    if: ${{ !inputs.callback_only && !inputs.reentry_only }}
+    if: ${{ !inputs.callback_only && !inputs.reentry_only && !inputs.assemble_apple_only }}
     runs-on: macos-15
     timeout-minutes: 180
     env:
@@ -155,6 +162,17 @@ jobs:
             //c:engine_session_submission_reentry_test \
             //c:conversation_factory_count_test \
             2>&1 | tee native-c-stream-terminal-tests.log
+      - name: Mac linked Metal environment and sampler bootstrap
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" test --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            --nocache_test_results --test_output=all --test_timeout=60 --verbose_failures \
+            --test_filter='LiteRtUtilTest.MacGenerationRegistersLinkedMetalAndCreatesGpuSampler:LiteRtUtilTest.MacEmbeddingRegistersLinkedMetalOnlyWhenRequested' \
+            //runtime/util:litert_util_test \
+            2>&1 | tee native-mac-metal-bootstrap-tests.log
       - name: Preserve host test results before changing platforms
         if: always()
         run: |
@@ -206,6 +224,7 @@ jobs:
             native-tests.log
             native-conversation-cache-tests.log
             native-c-stream-terminal-tests.log
+            native-mac-metal-bootstrap-tests.log
             native-framework.log
             native-package.log
             native-macos-framework.log
@@ -226,8 +245,119 @@ jobs:
           path: ${{ env.BAZEL_DISK_CACHE }}
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
 
+  assemble:
+    if: ${{ inputs.assemble_apple_only }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+      GH_TOKEN: ${{ github.token }}
+      ASSEMBLY_INPUTS_JSON: ${{ inputs.assembly_inputs }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          lfs: false
+          fetch-depth: 0
+      - name: Validate explicit assembly-only publication inputs
+        env:
+          OTHER_MODES: ${{ inputs.callback_only || inputs.reentry_only || inputs.host_only || inputs.macos_arm64_only }}
+        run: |
+          test "$(uname -m)" = arm64
+          python3 - <<'PY'
+          import json, os, re
+          assert os.environ['OTHER_MODES'] != 'true', 'Assembly is a separate, explicit mode'
+          values = json.loads(os.environ['ASSEMBLY_INPUTS_JSON'])
+          assert isinstance(values, dict) and set(values) == {'IOS_RELEASE', 'MAC_RELEASE', 'ASSEMBLY_RELEASE',
+              'IOS_MANIFEST_SHA256', 'MAC_MANIFEST_SHA256', 'MAC_COMPILED_SOURCE', 'MAC_PACKAGING_REVISION'}
+          assert all(isinstance(value, str) for value in values.values())
+          for key in ['IOS_RELEASE', 'MAC_RELEASE', 'ASSEMBLY_RELEASE']:
+              assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', values[key]), key
+          assert re.fullmatch(r'guideai-native-[a-z0-9._-]+', values['ASSEMBLY_RELEASE']), 'Undiscoverable output release tag'
+          for key in ['IOS_MANIFEST_SHA256', 'MAC_MANIFEST_SHA256']:
+              assert re.fullmatch(r'[0-9a-f]{64}', values[key]), key
+          for key in ['MAC_COMPILED_SOURCE', 'MAC_PACKAGING_REVISION']:
+              assert re.fullmatch(r'[0-9a-f]{40}', values[key]), key
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              for key, value in values.items(): output.write(key + '=' + value + '\n')
+          PY
+      - name: Refuse an existing output tag or release before assembly
+        run: |
+          python3 - <<'PYTHON'
+          import os, urllib.request, urllib.error
+          repository = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['ASSEMBLY_RELEASE']
+          for suffix in ['git/ref/tags/' + tag, 'releases/tags/' + tag]:
+              request = urllib.request.Request('https://api.github.com/repos/' + repository + '/' + suffix,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      raise RuntimeError('Assembly output already exists: ' + suffix)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+          PYTHON
+      - name: Fetch exact small manifests and their closed native archive sets
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, subprocess
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from package_apple_runtime import validate_assembly_manifest, digest, ASSEMBLY_IOS_SOURCE
+          for platform, tag_key, hash_key in [('ios', 'IOS_RELEASE', 'IOS_MANIFEST_SHA256'), ('macos', 'MAC_RELEASE', 'MAC_MANIFEST_SHA256')]:
+              directory = Path('assembly-inputs') / platform
+              directory.mkdir(parents=True)
+              base = ['gh', 'release', 'download', os.environ[tag_key], '--repo', os.environ['GITHUB_REPOSITORY'], '--dir', str(directory)]
+              subprocess.run([*base, '--pattern', 'APPLE_RUNTIME_MANIFEST.json'], check=True)
+              manifest = directory / 'APPLE_RUNTIME_MANIFEST.json'
+              assert digest(manifest) == os.environ[hash_key], 'Release manifest digest changed'
+              value = json.loads(manifest.read_bytes())
+              validate_assembly_manifest(value, macos=platform == 'macos',
+                  compiled_source=os.environ['MAC_COMPILED_SOURCE'] if platform == 'macos' else ASSEMBLY_IOS_SOURCE,
+                  packaging_revision=os.environ['MAC_PACKAGING_REVISION'] if platform == 'macos' else ASSEMBLY_IOS_SOURCE)
+              for row in value['archives'].values():
+                  subprocess.run([*base, '--pattern', row['file']], check=True)
+          PY
+      - name: Synthetic assembly rejection controls
+        run: python3 tools/package_apple_runtime_test.py
+      - name: Assemble unchanged native slices and read back the complete graph
+        run: |
+          set -o pipefail
+          python3 tools/package_apple_runtime.py --assemble-apple-artifacts \
+            --macos-artifact assembly-inputs/macos \
+            --ios-manifest-sha256 "$IOS_MANIFEST_SHA256" \
+            --macos-manifest-sha256 "$MAC_MANIFEST_SHA256" \
+            --macos-compiled-source "$MAC_COMPILED_SOURCE" \
+            --macos-packaging-revision "$MAC_PACKAGING_REVISION" \
+            assembly-inputs/ios native-apple-assembly 2>&1 | tee native-apple-assembly.log
+      - name: Create a fresh draft release with exactly eight XCFramework assets
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$ASSEMBLY_RELEASE" -f "sha=$GITHUB_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ASSEMBLY_RELEASE" --jq '.object.type')" = commit
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ASSEMBLY_RELEASE" --jq '.object.sha')" = "$GITHUB_SHA"
+          gh release create "$ASSEMBLY_RELEASE" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$ASSEMBLY_RELEASE" \
+            --notes 'Apple arm64 slice assembly; see per-platform compiler provenance. No GPU discovery, app, model or Intel qualification is transferred.'
+          gh release upload "$ASSEMBLY_RELEASE" --repo "$GITHUB_REPOSITORY" \
+            native-apple-assembly/*.xcframework.zip \
+            native-apple-assembly/APPLE_RUNTIME_MANIFEST.json native-apple-assembly/SHA256SUMS
+      - name: Retain assembly readback and any exact partial failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-apple-assembly-${{ github.sha }}
+          path: |
+            native-apple-assembly/
+            native-apple-assembly-failure/
+            native-apple-assembly.log
+          if-no-files-found: warn
+
   callback:
-    if: ${{ inputs.callback_only || inputs.reentry_only }}
+    if: ${{ (inputs.callback_only || inputs.reentry_only) && !inputs.assemble_apple_only }}
     uses: ./.github/workflows/native-callback-contract.yml
     with:
       test_filter: ${{ inputs.callback_test_filter }}

@@ -207,12 +207,23 @@ cc_test(
     ],
 )
 
+# Match only the Mac arm64 prebuilt slice; Intel and every other platform keep
+# their existing dependency selection. Local setting preserves the CI cache key.
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+)
+
 # iOS runtime APIs are strong dependencies, packaged as separate frameworks.
 cc_library(
     name = "apple_metal_sampler_lib",
     srcs = select({
         "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtTopKMetalSampler.dylib"],
         "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtTopKMetalSampler.dylib"],
+        ":macos_arm64": ["//prebuilt/macos_arm64:libLiteRtTopKMetalSampler.dylib"],
         "//conditions:default": [],
     }),
 )
@@ -222,6 +233,7 @@ cc_library(
     srcs = select({
         "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtMetalAccelerator.dylib"],
         "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtMetalAccelerator.dylib"],
+        ":macos_arm64": ["//prebuilt/macos_arm64:libLiteRtMetalAccelerator.dylib"],
         "//conditions:default": [],
     }),
 )

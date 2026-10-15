@@ -14,6 +14,8 @@ import plistlib
 import re
 import shutil
 import shlex
+import stat
+import struct
 import subprocess
 import tempfile
 import zipfile
@@ -252,25 +254,226 @@ def framework_metadata(name, platform, binary):
     return {"CFBundleExecutable": name, "CFBundleIdentifier": f"com.guideai.litert.{name}",
             "CFBundleName": name, "CFBundlePackageType": "FMWK", "CFBundleVersion": "1",
             "CFBundleShortVersionString": upstream_release_version(), "MinimumOSVersion": minimum,
-            "CFBundleSupportedPlatforms": [{"IOS": "iPhoneOS", "IOSSIMULATOR": "iPhoneSimulator", "MACOS": "MacOSX"}[platform]]}
+            "CFBundleSupportedPlatforms": [{"IOS": "iPhoneOS", "IOSSIMULATOR": "iPhoneSimulator", "MACOS": "MacOSX"}[platform]],
+            **({"LSMinimumSystemVersion": minimum} if platform == "MACOS" else {})}
 
 
-def rewrite_linkage(binary, name, libraries=LIBRARIES):
+def rewrite_linkage(binary, name, libraries=LIBRARIES, *, macos=False):
     # Rewrite the signed copy, then replace its signature when the completed
     # framework is sealed. Early removal can leave signature-alignment padding
     # at the end of __LINKEDIT that older install_name_tool versions reject.
-    run("install_name_tool", "-id", install_name(name), str(binary))
+    # A standard root binary alias reaches Versions/Current. Already-packaged
+    # Mac inputs need no load-command growth or install-name mutation.
+    if not macos or run("otool", "-D", str(binary)).splitlines()[1:] != [install_name(name)]:
+        run("install_name_tool", "-id", install_name(name), str(binary))
     for dependency in dependencies(binary):
         old = dependency.removeprefix("@rpath/")
         if dependency.startswith("@rpath/") and old in libraries:
             run("install_name_tool", "-change", dependency, install_name(libraries[old]), str(binary))
 
 
-def zip_directory(directory, archive):
+def macos_links(name):
+    return {name: "Versions/Current/" + name, "Headers": "Versions/Current/Headers",
+            "Modules": "Versions/Current/Modules", "Resources": "Versions/Current/Resources",
+            "Versions/Current": "A"}
+
+
+def validate_macos_layout(framework, name):
+    expected = macos_links(name)
+    links = {p.relative_to(framework).as_posix(): p.readlink().as_posix()
+             for p in framework.rglob("*") if p.is_symlink()}
+    if links != expected or {p.name for p in framework.iterdir()} != {name, "Headers", "Modules", "Resources", "Versions"}:
+        raise RuntimeError("Incorrect versioned Mac framework links/layout")
+    if {p.name for p in (framework / "Versions").iterdir()} != {"A", "Current"}:
+        raise RuntimeError("Unexpected Mac framework version")
+    version = framework / "Versions/A"
+    if not (version / name).is_file() or (version / name).is_symlink():
+        raise RuntimeError("Missing real versioned Mac executable")
+    if not (version / "Resources/Info.plist").is_file():
+        raise RuntimeError("Missing versioned Mac Info.plist")
+    for relative, target in expected.items():
+        path = framework / relative
+        if not path.resolve(strict=True).is_relative_to(version.resolve(strict=True)):
+            raise RuntimeError("Escaping/broken Mac framework link")
+    return links
+
+
+def create_macos_framework(work, name, original, metadata):
+    framework = work / "macos-arm64" / (name + ".framework")
+    version = framework / "Versions/A"
+    for directory in ["Headers", "Modules", "Resources"]:
+        (version / directory).mkdir(parents=True, exist_ok=True)
+    shutil.copy2(original, version / name)
+    (version / "Resources/Info.plist").write_bytes(plistlib.dumps(metadata))
+    if name == "CLiteRTLM":
+        for header in PUBLIC_C_HEADERS:
+            shutil.copy2(ROOT / "c" / header, version / "Headers" / header)
+        headers = "".join('  header "' + h + '"\n' for h in PUBLIC_C_HEADERS)
+    else:
+        (version / "Headers/RuntimeDependency.h").write_text("// APIs are bound internally by CLiteRTLM.\n")
+        headers = '  umbrella header "RuntimeDependency.h"\n'
+    (version / "Modules/module.modulemap").write_text(
+        "framework module " + name + " {\n" + headers + "  export *\n}\n")
+    for relative, target in macos_links(name).items():
+        (framework / relative).symlink_to(target)
+    validate_macos_layout(framework, name)
+    return framework
+
+
+def native_content_identity(data, name):
+    """Compare all native payload and load commands except explicit linkage/signing fields."""
+    if len(data) < 32 or struct.unpack_from("<II", data) != (0xfeedfacf, 0x100000c):
+        raise RuntimeError("Expected thin arm64 Mach-O")
+    header = struct.unpack_from("<8I", data)
+    count, size = header[4:6]
+    offset = 32; commands = []; first_section = len(data); signature = None; linkedit = None
+    mapping = {install_name(n): install_name(n) for n in ["CLiteRTLM", *MAC_LIBRARIES.values()]}
+    mapping.update({"@rpath/" + lib: install_name(n) for lib, n in MAC_LIBRARIES.items()})
+    for _ in range(count):
+        command, length = struct.unpack_from("<II", data, offset)
+        if length < 8 or offset + length > 32 + size or 32 + size > len(data):
+            raise RuntimeError("Malformed native load command")
+        raw = bytearray(data[offset:offset + length])
+        if command == 0x1d:
+            if signature is not None: raise RuntimeError("Duplicate native signature")
+            signature = struct.unpack_from("<II", raw, 8)
+        elif command in {0xc, 0xd, 0x80000018, 0x8000001f, 0x20, 0x80000023}:
+            start = struct.unpack_from("<I", raw, 8)[0]
+            pieces = bytes(raw[start:]).split(b"\0", 1)
+            if start != 24 or len(pieces) != 2 or any(pieces[1]):
+                raise RuntimeError("Unexpected native linkage command layout")
+            linked = pieces[0].decode("utf-8")
+            linked = install_name(name) if command == 0xd else mapping.get(linked, linked)
+            commands.append((command, linked, struct.unpack_from("<III", raw, 12)))
+        else:
+            if command == 0x19:
+                sections = struct.unpack_from("<I", raw, 64)[0]
+                for index in range(sections):
+                    section = 72 + index * 80
+                    position = struct.unpack_from("<I", raw, section + 48)[0]
+                    section_size = struct.unpack_from("<Q", raw, section + 40)[0]
+                    if position and section_size: first_section = min(first_section, position)
+                if raw[8:24].rstrip(b"\0") == b"__LINKEDIT":
+                    if linkedit is not None: raise RuntimeError("Duplicate native LINKEDIT")
+                    linkedit = struct.unpack_from("<QQQ", raw, 32)
+                    struct.pack_into("<Q", raw, 32, 0)  # signature allocation changes vmsize
+                    struct.pack_into("<Q", raw, 48, 0)  # and final filesize only
+            commands.append((command, bytes(raw).hex()))
+        offset += length
+    if offset != 32 + size or signature is None or signature[0] + signature[1] != len(data):
+        raise RuntimeError("Expected terminal native code signature")
+    if linkedit is None or linkedit[1] + linkedit[2] != len(data) or linkedit[0] < linkedit[2]:
+        raise RuntimeError("Native LINKEDIT must end with the signature and cover its file bytes")
+    if first_section < offset or first_section > signature[0] or any(data[offset:first_section]):
+        raise RuntimeError("Unexpected native header padding/layout")
+    return {"header": header[:4] + header[6:], "commands": commands,
+            "payloadSHA256": hashlib.sha256(data[first_section:signature[0]]).hexdigest(),
+            "payloadBytes": signature[0] - first_section, "firstSectionOffset": first_section}
+
+
+def require_same_native_content(before, after, name):
+    original = native_content_identity(before, name)
+    if native_content_identity(after, name) != original:
+        raise RuntimeError("Native code/data or unrelated load metadata changed: " + name)
+    return hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest()
+
+
+def make_macos_xcframework(work, name, original, metadata):
+    """The single native packaging path shared by full builds and exact repackaging."""
+    framework = create_macos_framework(work, name, original, metadata)
+    binary = framework / name
+    rewrite_linkage(binary, name, MAC_LIBRARIES, macos=True)
+    run("codesign", "--force", "--sign", "-", str(framework))
+    content = require_same_native_content(original.read_bytes(), binary.read_bytes(), name)
+    target = work / (name + ".xcframework")
+    run("xcodebuild", "-create-xcframework", "-framework", str(framework), "-output", str(target))
+    validate_macos_layout(target / "macos-arm64" / (name + ".framework"), name)
+    return target, content
+
+
+def zip_directory(directory, archive, *, macos=False):
+    if macos:
+        for framework in directory.glob("macos-arm64/*.framework"):
+            validate_macos_layout(framework, framework.stem)
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as bundle:
         for path in sorted(directory.rglob("*")):
-            if path.is_file():
+            if macos and path.is_symlink():
+                info = zipfile.ZipInfo(path.relative_to(directory.parent).as_posix())
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                bundle.writestr(info, path.readlink().as_posix().encode("utf-8"))
+            elif path.is_file():
                 bundle.write(path, path.relative_to(directory.parent))
+
+
+def extract_macos_archive(archive, destination, name, *, versioned):
+    """Only the exact framework link graph is permitted; no generic ZIP symlinks."""
+    prefix = name + ".xcframework/"
+    result = destination / (name + ".xcframework")
+    if result.exists() or result.is_symlink():
+        raise RuntimeError("Never overwrite a Mac archive extraction")
+    if destination.is_symlink():
+        raise RuntimeError("Mac archive extraction root cannot be a symlink")
+    expected_links = {prefix + "macos-arm64/" + name + ".framework/" + p: t
+                      for p, t in macos_links(name).items()} if versioned else {}
+    with zipfile.ZipFile(archive) as bundle:
+        entries = bundle.infolist()
+        if sum(e.file_size for e in entries) > 256 * 1024 * 1024:
+            raise RuntimeError("Mac archive exceeds finite size bound")
+        names = [e.filename.rstrip("/") for e in entries]
+        if len(set(names)) != len(names):
+            raise RuntimeError("Duplicate Mac archive entry")
+        links = {}
+        for entry in entries:
+            path = Path(entry.filename)
+            if (path.is_absolute() or not entry.filename.startswith(prefix)
+                    or any(p in {"..", "."} for p in entry.filename.split("/") if p)
+                    or "\\" in entry.filename):
+                raise RuntimeError("Unsafe Mac archive path")
+            mode = entry.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                target = bundle.read(entry).decode("utf-8")
+                if expected_links.get(entry.filename) != target:
+                    raise RuntimeError("Unexpected/escaping Mac archive symlink")
+                links[entry.filename] = target
+            elif stat.S_IFMT(mode) not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise RuntimeError("Unsupported Mac archive member type")
+        if links != expected_links:
+            raise RuntimeError("Missing Mac archive symlinks")
+        for entry in entries:
+            if entry.filename in links:
+                continue
+            if any(entry.filename.startswith(link + "/") for link in links):
+                raise RuntimeError("Mac archive writes through symlink")
+            path = destination / entry.filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if entry.is_dir(): path.mkdir(exist_ok=True)
+            else:
+                with path.open("xb") as output: output.write(bundle.read(entry))
+                path.chmod((entry.external_attr >> 16) & 0o777 or 0o644)
+        for relative, target in links.items():
+            path = destination / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+    if versioned:
+        validate_macos_layout(result / "macos-arm64" / (name + ".framework"), name)
+    return result
+
+
+def write_macos_archives(frameworks, destination, work):
+    archives = {}
+    for name, framework in frameworks.items():
+        archive = destination / (("CLiteRTLM_mac" if name == "CLiteRTLM" else name) + ".xcframework.zip")
+        zip_directory(framework, archive, macos=True)
+        roundtrip = extract_macos_archive(archive, work / "roundtrip", name, versioned=True)
+        def identity(root):
+            return {p.relative_to(root).as_posix(): {"link": p.readlink().as_posix()} if p.is_symlink()
+                    else {"sha256": digest(p), "bytes": p.stat().st_size}
+                    for p in root.rglob("*") if p.is_symlink() or p.is_file()}
+        if identity(roundtrip) != identity(framework):
+            raise RuntimeError("Versioned archive roundtrip differs")
+        archives[name] = {"file": archive.name, "sha256": digest(archive), "bytes": archive.stat().st_size}
+    return archives
 
 
 def inspect(frameworks, *, macos_arm64=False):
@@ -294,13 +497,16 @@ def inspect(frameworks, *, macos_arm64=False):
                 raise RuntimeError(f"Incorrect declared platform in {xcframework}/{identifier}")
             framework = xcframework / identifier / entry["LibraryPath"]
             binary = framework / name
-            metadata = plistlib.loads((framework / "Info.plist").read_bytes())
+            links = validate_macos_layout(framework, name) if macos_arm64 else None
+            metadata = plistlib.loads((framework / ("Resources/Info.plist" if macos_arm64 else "Info.plist")).read_bytes())
             if metadata.get("CFBundleExecutable") != name or metadata.get("CFBundlePackageType") != "FMWK":
                 raise RuntimeError(f"Invalid framework metadata at {framework}")
             if run("lipo", "-archs", str(binary)) != "arm64":
                 raise RuntimeError(f"Wrong architecture at {binary}")
             minimum = minimum_os_from_build(run("vtool", "-show-build", str(binary)), platform)
             validate_minimum_os_metadata(minimum, metadata.get("MinimumOSVersion"))
+            if macos_arm64 and metadata.get("LSMinimumSystemVersion") != metadata.get("MinimumOSVersion"):
+                raise RuntimeError("Incoherent Mac minimum OS metadata")
             linked = dependencies(binary)
             own_id = run("otool", "-D", str(binary)).splitlines()[1:]
             if own_id != [install_name(name)]:
@@ -333,12 +539,13 @@ def inspect(frameworks, *, macos_arm64=False):
                             "sha256": digest(binary), "dependencies": linked,
                             "minimumOS": minimum, "frameworkMinimumOSVersion": metadata["MinimumOSVersion"],
                             "requiredGemmaABIExports": sorted(required_gemma_exports),
-                            **({"definedExports": sorted(symbols)} if macos_arm64 else {})})
+                            **({"definedExports": sorted(symbols), "bundleLayout": "Versions/A", "installID": own_id[0],
+                                "symbolicLinks": links} if macos_arm64 else {})})
     return results
 
 
 @contextmanager
-def retained_package_work(source_archive, destination, source):
+def retained_package_work(source_archive, destination, source, *, preserve_symlinks=False):
     failure_directory = destination.with_name(destination.name + "-failure")
     if failure_directory.exists():
         raise RuntimeError("Never replace retained package failure evidence")
@@ -349,7 +556,7 @@ def retained_package_work(source_archive, destination, source):
         except Exception as error:
             # Preserve the binaries at the actual failing operation. The original
             # Bazel archive is uploaded separately, before any Mach-O edits.
-            shutil.copytree(work, failure_directory)
+            shutil.copytree(work, failure_directory, symlinks=preserve_symlinks)
             (failure_directory / "FAILURE.json").write_text(json.dumps({
                 "source": source, "sourceArchiveSHA256": digest(source_archive),
                 "artifactAcceptance": False, "modelQueries": 0,
@@ -460,42 +667,20 @@ def package_macos_arm64(output_list, destination):
         raise RuntimeError("Mac development producer is scoped to v0.18.0")
     pins = pinned_macos_libraries()
     original_sha = digest(source_binary)
-    with retained_package_work(source_binary, destination, source) as work:
+    with retained_package_work(source_binary, destination, source, preserve_symlinks=True) as work:
         binaries = {"CLiteRTLM": source_binary, **{name: ROOT / "prebuilt/macos_arm64" / library
                      for library, name in MAC_LIBRARIES.items()}}
         frameworks = {}
+        content_proofs = {}
         for name, original in binaries.items():
-            framework = work / "macos-arm64" / (name + ".framework")
-            (framework / "Headers").mkdir(parents=True)
-            (framework / "Modules").mkdir()
-            binary = framework / name
-            shutil.copy2(original, binary)
-            (framework / "Info.plist").write_bytes(plistlib.dumps(framework_metadata(name, "MACOS", binary)))
-            if name == "CLiteRTLM":
-                for header in PUBLIC_C_HEADERS:
-                    shutil.copy2(ROOT / "c" / header, framework / "Headers" / header)
-                headers = "".join('  header "' + h + '"\n' for h in PUBLIC_C_HEADERS)
-            else:
-                (framework / "Headers/RuntimeDependency.h").write_text("// APIs are bound internally by CLiteRTLM.\n")
-                headers = '  umbrella header "RuntimeDependency.h"\n'
-            (framework / "Modules/module.modulemap").write_text(
-                "framework module " + name + " {\n" + headers + "  export *\n}\n")
-            rewrite_linkage(binary, name, MAC_LIBRARIES)
-            run("codesign", "--force", "--sign", "-", str(framework))
-            target = work / (name + ".xcframework")
-            run("xcodebuild", "-create-xcframework", "-framework", str(framework), "-output", str(target))
-            frameworks[name] = target
+            frameworks[name], content_proofs[name] = make_macos_xcframework(
+                work, name, original, framework_metadata(name, "MACOS", original))
         results = inspect(frameworks, macos_arm64=True)
         # Original compiler output and LFS objects must survive packaging unchanged.
         if digest(source_binary) != original_sha or pinned_macos_libraries() != pins:
             raise RuntimeError("Mac build or pinned dependencies changed during packaging")
         destination.mkdir()
-        archives = {}
-        for name, framework in frameworks.items():
-            filename = ("CLiteRTLM_mac" if name == "CLiteRTLM" else name) + ".xcframework.zip"
-            archive = destination / filename
-            zip_directory(framework, archive)
-            archives[name] = {"file": filename, "sha256": digest(archive), "bytes": archive.stat().st_size}
+        archives = write_macos_archives(frameworks, destination, work)
         report = {"source": source, "upstreamVersion": "0.18.0", "developmentOnly": True,
                   "architectures": ["arm64"], "intelQualified": False,
                   "productionDefaultChanged": False, "modelQueries": 0,
@@ -503,7 +688,8 @@ def package_macos_arm64(output_list, destination):
                   "target": "//swift:CLiteRTLM_dylib", "declaredOutput": source_binary.relative_to(ROOT).as_posix(),
                   "sourceBinarySHA256": original_sha, "prebuiltLFSObjects": pins,
                   "packagedDependencyClosure": True, "frameworks": results, "archives": archives,
-                  "gemmaABIExportOwners": GEMMA_ABI_OWNERS}
+                  "gemmaABIExportOwners": GEMMA_ABI_OWNERS,
+                  "nativeContentIdentitySHA256": content_proofs}
         (destination / "SOURCE_COMMIT").write_text(source + "\n")
         (destination / "SHA256SUMS").write_text("".join(
             f'{v["sha256"]}  {v["file"]}\n' for v in archives.values()))
@@ -511,13 +697,312 @@ def package_macos_arm64(output_list, destination):
         print(json.dumps(report, indent=2))
 
 
+REPACKAGE_MANIFEST_SHA256 = "cc6bd22c595b75cc8b05281602c4707795431739a7b4005d2c7fdd6411d6430b"
+REPACKAGE_COMPILED_SOURCE = "796b2281a5848221a3710cd528b23b1b5ac66b34"
+
+
+def validate_repackage_source(manifest, manifest_sha, revision, changed):
+    allowed = {"tools/package_apple_runtime.py", "tools/package_apple_runtime_test.py"}
+    if (manifest_sha != REPACKAGE_MANIFEST_SHA256 or manifest.get("source") != REPACKAGE_COMPILED_SOURCE
+            or set(changed) - allowed or re.fullmatch(r"[0-9a-f]{40}", revision) is None):
+        raise RuntimeError("Repackage requires exact compiled source and packaging-only revision")
+    expected = {"CLiteRTLM", *MAC_LIBRARIES.values()}
+    if (set(manifest["archives"]) != expected or {r["name"] for r in manifest["frameworks"]} != expected
+            or manifest["architectures"] != ["arm64"] or manifest["upstreamVersion"] != "0.18.0"
+            or manifest["intelQualified"] or manifest["productionDefaultChanged"]):
+        raise RuntimeError("Incorrect original whole-SDK repackage closure")
+
+
+def repackage_macos_arm64(artifact, destination):
+    """Repackage one exact compiled artifact; never invokes Bazel or substitutes binaries."""
+    if destination.exists(): raise RuntimeError("Never replace a retained package")
+    manifest_path = artifact / "APPLE_RUNTIME_MANIFEST.json"
+    original_manifest = json.loads(manifest_path.read_bytes())
+    revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"):
+        raise RuntimeError("Package only committed source")
+    changed = run("git", "-C", str(ROOT), "diff", "--name-only", REPACKAGE_COMPILED_SOURCE, revision).splitlines()
+    validate_repackage_source(original_manifest, digest(manifest_path), revision, changed)
+    input_archives = {}
+    for name, row in original_manifest["archives"].items():
+        archive = artifact / row["file"]
+        if archive.is_symlink() or not archive.is_file() or archive.stat().st_size != row["bytes"] or digest(archive) != row["sha256"]:
+            raise RuntimeError("Original compiled archive changed: " + name)
+        input_archives[name] = archive
+    with retained_package_work(manifest_path, destination, revision, preserve_symlinks=True) as work:
+        frameworks = {}; content_proofs = {}; input_binaries = {}
+        for row in original_manifest["frameworks"]:
+            name = row["name"]
+            extracted = extract_macos_archive(input_archives[name], work / "inputs", name, versioned=False)
+            original_framework = extracted / "macos-arm64" / (name + ".framework")
+            original = original_framework / name
+            if digest(original) != row["sha256"]:
+                raise RuntimeError("Original compiled binary changed: " + name)
+            run("codesign", "--verify", "--strict", str(original_framework))
+            input_binaries[name] = digest(original)
+            metadata = plistlib.loads((original_framework / "Info.plist").read_bytes())
+            metadata["LSMinimumSystemVersion"] = metadata["MinimumOSVersion"]
+            frameworks[name], content_proofs[name] = make_macos_xcframework(work, name, original, metadata)
+        results = inspect(frameworks, macos_arm64=True)
+        for row in results:
+            previous = next(r for r in original_manifest["frameworks"] if r["name"] == row["name"])
+            if row["definedExports"] != previous["definedExports"] or row["minimumOS"] != previous["minimumOS"]:
+                raise RuntimeError("Repackaging changed native API or platform")
+        if digest(manifest_path) != REPACKAGE_MANIFEST_SHA256 or any(
+                digest(path) != original_manifest["archives"][name]["sha256"] for name, path in input_archives.items()):
+            raise RuntimeError("Original artifact changed during packaging")
+        destination.mkdir(); archives = write_macos_archives(frameworks, destination, work)
+        report = {**original_manifest, "source": REPACKAGE_COMPILED_SOURCE,
+                  "compiledSource": REPACKAGE_COMPILED_SOURCE, "packagingRevision": revision,
+                  "compilerOutputRebuilt": False, "repackagedFromManifestSHA256": REPACKAGE_MANIFEST_SHA256,
+                  "originalArchives": original_manifest["archives"], "originalBinarySHA256": input_binaries,
+                  "nativeContentIdentitySHA256": content_proofs, "frameworks": results, "archives": archives,
+                  "appAcceptance": False, "modelAcceptance": False, "nativeHostTestsRerun": False,
+                  "originalCompilerSourceHostEvidence": {"workflowRunID": 38696736097,
+                      "testExecutions": 341, "newPackageAcceptanceTransferred": False}}
+        (destination / "SOURCE_COMMIT").write_text(REPACKAGE_COMPILED_SOURCE + "\n")
+        (destination / "PACKAGING_COMMIT").write_text(revision + "\n")
+        (destination / "SHA256SUMS").write_text("".join(f'{r["sha256"]}  {r["file"]}\n' for r in archives.values()))
+        (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+
+
+ASSEMBLY_IOS_SOURCE = "20fe6897c60547bbad0821f738d675f15e65b298"
+ASSEMBLY_COMMON = {"CLiteRTLM", *LIBRARIES.values()}
+ASSEMBLY_MAC_NAMES = {"CLiteRTLM", *MAC_LIBRARIES.values()}
+
+
+def validate_assembly_manifest(manifest, *, macos, compiled_source, packaging_revision):
+    """Admit only the two previously built compiler cohorts, not arbitrary SDKs."""
+    expected = ASSEMBLY_MAC_NAMES if macos else ASSEMBLY_COMMON
+    slices = MAC_SLICES if macos else SLICES
+    compiled = manifest.get("compiledSource", manifest.get("source"))
+    if (not isinstance(compiled_source, str) or re.fullmatch(r"[0-9a-f]{40}", compiled_source) is None
+            or not isinstance(packaging_revision, str) or re.fullmatch(r"[0-9a-f]{40}", packaging_revision) is None
+            or compiled != compiled_source or manifest.get("source") != compiled
+            or manifest.get("packagingRevision", compiled) != packaging_revision
+            or manifest.get("gemmaABIExportOwners") != GEMMA_ABI_OWNERS
+            or manifest.get("packagedDependencyClosure") is not True):
+        raise RuntimeError("Unreviewed assembly compiler/provenance/ABI cohort")
+    archives = manifest.get("archives")
+    if not isinstance(archives, dict) or set(archives) != expected:
+        raise RuntimeError("Incomplete assembly archive closure")
+    for name, row in archives.items():
+        filename = ("CLiteRTLM_mac" if macos and name == "CLiteRTLM" else name) + ".xcframework.zip"
+        if (not isinstance(row, dict) or row.get("file") != filename
+                or not isinstance(row.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                or ("bytes" in row and (type(row["bytes"]) is not int or row["bytes"] <= 0))):
+            raise RuntimeError("Invalid assembly archive binding")
+    rows = manifest.get("frameworks")
+    if not isinstance(rows, list) or len(rows) != len(expected) * len(slices):
+        raise RuntimeError("Incomplete assembly slice closure")
+    observed = set()
+    for row in rows:
+        if not isinstance(row, dict): raise RuntimeError("Invalid assembly slice row")
+        key = (row.get("name"), row.get("slice"))
+        if key in observed or key[0] not in expected or key[1] not in slices:
+            raise RuntimeError("Unexpected/duplicate assembly slice")
+        observed.add(key)
+        if (row.get("platform") != slices[key[1]][1]
+                or not isinstance(row.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                or set(row.get("requiredGemmaABIExports", [])) !=
+                   {symbol for symbol, owner in GEMMA_ABI_OWNERS.items() if owner == key[0]}):
+            raise RuntimeError("Invalid assembly platform/native ABI row")
+    return expected
+
+
+def assembly_upstream_release(compiler_sources):
+    """The compiler sources may differ; their official release ancestry may not."""
+    current = json.loads((ROOT / "UPSTREAM_RELEASE.json").read_bytes())
+    expected = {"tag": current.get("tag"), "commit": current.get("commit")}
+    if (expected["tag"] != "v0.18.0" or not isinstance(expected["commit"], str)
+            or re.fullmatch(r"[0-9a-f]{40}", expected["commit"]) is None):
+        raise RuntimeError("Missing explicit upstream release ancestry")
+    for source in compiler_sources:
+        original = json.loads(run("git", "-C", str(ROOT), "show", source + ":UPSTREAM_RELEASE.json"))
+        if {"tag": original.get("tag"), "commit": original.get("commit")} != expected:
+            raise RuntimeError("Assembly compiler upstream releases differ")
+    return expected
+
+
+def assembly_tree_identity(directory):
+    return {p.relative_to(directory).as_posix(): {"link": p.readlink().as_posix()} if p.is_symlink()
+            else {"sha256": digest(p), "bytes": p.stat().st_size}
+            for p in directory.rglob("*") if p.is_symlink() or p.is_file()}
+
+
+def validate_assembly_layout(xcframework, name, identifiers):
+    info = plistlib.loads((xcframework / "Info.plist").read_bytes())
+    if (set(info) != {"AvailableLibraries", "CFBundlePackageType", "XCFrameworkFormatVersion"}
+            or info["CFBundlePackageType"] != "XFWK" or info["XCFrameworkFormatVersion"] != "1.0"
+            or {p.name for p in xcframework.iterdir()} != {"Info.plist", *identifiers}):
+        raise RuntimeError("Invalid assembly XCFramework membership")
+    entries = info["AvailableLibraries"]
+    if (not isinstance(entries, list) or len(entries) != len(identifiers)
+            or {row.get("LibraryIdentifier") for row in entries} != set(identifiers)):
+        raise RuntimeError("Incorrect assembly declared slices")
+    for row in entries:
+        identifier = row["LibraryIdentifier"]
+        platform = "macos" if identifier == "macos-arm64" else "ios"
+        variant = "simulator" if identifier == "ios-arm64-simulator" else None
+        if (row.get("SupportedArchitectures") != ["arm64"] or row.get("SupportedPlatform") != platform
+                or row.get("SupportedPlatformVariant") != variant or row.get("LibraryPath") != name + ".framework"):
+            raise RuntimeError("Incorrect assembly architecture/platform declaration")
+        slice_root = xcframework / identifier
+        if slice_root.is_symlink() or {p.name for p in slice_root.iterdir()} != {name + ".framework"}:
+            raise RuntimeError("Unexpected assembly slice payload")
+        framework = slice_root / (name + ".framework")
+        modulemap = (framework / "Modules/module.modulemap").read_text()
+        if re.findall(r"(?m)^\s*(?:framework\s+)?module\s+(\w+)\b", modulemap) != [name]:
+            raise RuntimeError("Incoherent assembly C/Swift module name")
+        if identifier == "macos-arm64": validate_macos_layout(framework, name)
+    return info
+
+
+def verify_assembly_zip(archive, directory, name):
+    """Verify ZIP bytes/links without a second large extraction or unsafe writes."""
+    prefix = name + ".xcframework/"
+    actual = {}
+    with zipfile.ZipFile(archive) as bundle:
+        for row in bundle.infolist():
+            relative = row.filename.removeprefix(prefix)
+            if (not row.filename.startswith(prefix) or not relative or row.is_dir()
+                    or Path(relative).is_absolute() or any(p in {"", ".", ".."} for p in relative.split("/"))
+                    or "\\" in relative or relative in actual):
+                raise RuntimeError("Unsafe/duplicate assembly ZIP member")
+            mode = row.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                actual[relative] = {"link": bundle.read(row).decode("utf-8")}
+            elif stat.S_IFMT(mode) in {0, stat.S_IFREG}:
+                with bundle.open(row) as member:
+                    hashed = hashlib.sha256()
+                    for chunk in iter(lambda: member.read(1024 * 1024), b""): hashed.update(chunk)
+                    actual[relative] = {"sha256": hashed.hexdigest(), "bytes": row.file_size}
+            else: raise RuntimeError("Unsupported assembly ZIP member")
+    if actual != assembly_tree_identity(directory):
+        raise RuntimeError("Assembly ZIP changed framework bytes or links")
+
+
+def assemble_apple_artifacts(ios_artifact, macos_artifact, destination, ios_manifest_sha, macos_manifest_sha,
+                             macos_compiled_source, macos_packaging_revision):
+    """Join accepted slices; never compile, rewrite install names or re-sign."""
+    if destination.exists() or destination.is_symlink(): raise RuntimeError("Never replace a retained assembly")
+    paths = {"ios": ios_artifact / "APPLE_RUNTIME_MANIFEST.json", "macos": macos_artifact / "APPLE_RUNTIME_MANIFEST.json"}
+    expected = {"ios": ios_manifest_sha, "macos": macos_manifest_sha}
+    manifests = {}; archives = {}
+    for platform, path in paths.items():
+        if (not isinstance(expected[platform], str) or re.fullmatch(r"[0-9a-f]{64}", expected[platform]) is None
+                or path.parent.is_symlink() or path.is_symlink() or digest(path) != expected[platform]):
+            raise RuntimeError("Assembly input manifest binding changed")
+        manifest = json.loads(path.read_bytes()); manifests[platform] = manifest
+        validate_assembly_manifest(manifest, macos=platform == "macos",
+            compiled_source=macos_compiled_source if platform == "macos" else ASSEMBLY_IOS_SOURCE,
+            packaging_revision=macos_packaging_revision if platform == "macos" else ASSEMBLY_IOS_SOURCE)
+        for name, row in manifest["archives"].items():
+            archive = path.parent / row["file"]
+            if (archive.is_symlink() or not archive.is_file() or digest(archive) != row["sha256"]
+                    or ("bytes" in row and archive.stat().st_size != row["bytes"])):
+                raise RuntimeError("Assembly source archive changed: " + name)
+            archives[(platform, name)] = archive
+    revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD")
+    if (re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            or run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no")):
+        raise RuntimeError("Assemble only committed source")
+    upstream = assembly_upstream_release([ASSEMBLY_IOS_SOURCE, macos_compiled_source])
+    with retained_package_work(paths["ios"], destination, revision, preserve_symlinks=True) as work:
+        (work / "ASSEMBLY_INPUTS.json").write_text(json.dumps({k: {"manifestSHA256": expected[k],
+            "compiledSource": manifests[k]["source"]} for k in paths}, indent=2) + "\n")
+        extracted = {key: extract_macos_archive(path, work / key[0], key[1], versioned=key[0] == "macos")
+                     for key, path in archives.items()}
+        for (platform, name), directory in extracted.items():
+            validate_assembly_layout(directory, name, MAC_SLICES if platform == "macos" else SLICES)
+        ios = inspect({name: extracted[("ios", name)] for name in ASSEMBLY_COMMON})
+        macos = inspect({name: extracted[("macos", name)] for name in ASSEMBLY_MAC_NAMES}, macos_arm64=True)
+        for platform, rows in [("ios", ios), ("macos", macos)]:
+            originals = {(row["name"], row["slice"]): row for row in manifests[platform]["frameworks"]}
+            for row in rows:
+                original = originals[(row["name"], row["slice"])]
+                for field in ["sha256", "dependencies", "minimumOS", "frameworkMinimumOSVersion", "requiredGemmaABIExports"]:
+                    if row[field] != original[field]: raise RuntimeError("Assembly readback differs: " + field)
+                if row["name"] == "CLiteRTLM":
+                    binary = extracted[(platform, "CLiteRTLM")] / row["slice"] / "CLiteRTLM.framework/CLiteRTLM"
+                    row["definedExports"] = sorted(exported_symbols(binary))
+        combined = {}; output_rows = ios + macos
+        for name in sorted(ASSEMBLY_MAC_NAMES):
+            identifiers = [*SLICES, *MAC_SLICES] if name in ASSEMBLY_COMMON else list(MAC_SLICES)
+            target = work / "assembled" / (name + ".xcframework"); target.mkdir(parents=True)
+            entries = []
+            for platform in (["ios", "macos"] if name in ASSEMBLY_COMMON else ["macos"]):
+                original = extracted[(platform, name)]
+                info = validate_assembly_layout(original, name, MAC_SLICES if platform == "macos" else SLICES)
+                for entry in info["AvailableLibraries"]:
+                    identifier = entry["LibraryIdentifier"]
+                    shutil.copytree(original / identifier, target / identifier, symlinks=True)
+                    if assembly_tree_identity(original / identifier) != assembly_tree_identity(target / identifier):
+                        raise RuntimeError("Assembly altered an original native slice")
+                    entries.append(entry)
+            (target / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": entries,
+                "CFBundlePackageType": "XFWK", "XCFrameworkFormatVersion": "1.0"}))
+            validate_assembly_layout(target, name, identifiers); combined[name] = target
+        destination.mkdir(); output_archives = {}
+        for name, directory in combined.items():
+            archive = destination / (name + ".xcframework.zip")
+            zip_directory(directory, archive, macos=True); verify_assembly_zip(archive, directory, name)
+            output_archives[name] = {"file": archive.name, "sha256": digest(archive), "bytes": archive.stat().st_size,
+                "slices": [*SLICES, *MAC_SLICES] if name in ASSEMBLY_COMMON else list(MAC_SLICES)}
+        if any(digest(path) != expected[platform] for platform, path in paths.items()) or any(
+                digest(path) != manifests[platform]["archives"][name]["sha256"] for (platform, name), path in archives.items()):
+            raise RuntimeError("Assembly inputs changed during packaging")
+        provenance = {identifier: {"compiledSource": manifests[platform]["source"],
+            "packagingRevision": manifests[platform].get("packagingRevision", manifests[platform]["source"]),
+            "inputManifestSHA256": expected[platform]}
+            for platform, identifiers in [("ios", SLICES), ("macos", MAC_SLICES)] for identifier in identifiers}
+        report = {"formatVersion": 2, "kind": "apple-runtime-assembly", "source": revision,
+            "upstreamRelease": upstream, "platformProvenance": provenance,
+            "compilerOutputRebuilt": False, "nativeSliceBytesUnchanged": True,
+            "packagedDependencyClosure": True, "architectures": ["arm64"], "intelQualified": False,
+            "modelQueries": 0, "phoneAcceptance": False, "appAcceptance": False, "modelAcceptance": False,
+            "gpuRegistrationQualified": False, "frameworks": output_rows, "archives": output_archives,
+            "gemmaABIExportOwners": GEMMA_ABI_OWNERS}
+        encoded_report = json.dumps(report, indent=2) + "\n"
+        if len(encoded_report.encode("utf-8")) > 8 * 1024 * 1024:
+            raise RuntimeError("Assembly publication manifest exceeds8MiB; never truncate native evidence")
+        (destination / "APPLE_RUNTIME_MANIFEST.json").write_text(encoded_report)
+        (destination / "SOURCE_COMMIT").write_text(revision + "\n")
+        (destination / "SHA256SUMS").write_text("".join(f'{row["sha256"]}  {row["file"]}\n' for row in output_archives.values()))
+        print(json.dumps(report, indent=2))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--macos-arm64", action="store_true", help="Source-built arm64 development SDK; input is cquery output file list")
+    parser.add_argument("--repackage-macos-artifact", action="store_true", help="Repackage the exact796b compiled whole SDK as versioned Mac frameworks; no compiler")
+    parser.add_argument("--assemble-apple-artifacts", action="store_true", help="Assemble exact accepted iOS and Mac slices without rebuilding native code")
+    parser.add_argument("--macos-artifact", type=Path)
+    parser.add_argument("--ios-manifest-sha256")
+    parser.add_argument("--macos-manifest-sha256")
+    parser.add_argument("--macos-compiled-source")
+    parser.add_argument("--macos-packaging-revision")
     parser.add_argument("source_archive", type=Path)
     parser.add_argument("destination", type=Path)
     arguments = parser.parse_args()
-    if arguments.macos_arm64:
+    if sum([arguments.macos_arm64, arguments.repackage_macos_artifact, arguments.assemble_apple_artifacts]) > 1:
+        parser.error("Select only one Apple packaging mode")
+    if arguments.assemble_apple_artifacts:
+        if not all([arguments.macos_artifact, arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+                    arguments.macos_compiled_source, arguments.macos_packaging_revision]):
+            parser.error("Assembly requires explicit Mac input and both exact manifest hashes")
+        assemble_apple_artifacts(arguments.source_archive, arguments.macos_artifact, arguments.destination,
+                                 arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+                                 arguments.macos_compiled_source, arguments.macos_packaging_revision)
+    elif any([arguments.macos_artifact, arguments.ios_manifest_sha256, arguments.macos_manifest_sha256,
+              arguments.macos_compiled_source, arguments.macos_packaging_revision]):
+        parser.error("Assembly input bindings require explicit assembly mode")
+    elif arguments.repackage_macos_artifact:
+        repackage_macos_arm64(arguments.source_archive, arguments.destination)
+    elif arguments.macos_arm64:
         package_macos_arm64(arguments.source_archive, arguments.destination)
     else:
         package(arguments.source_archive, arguments.destination)

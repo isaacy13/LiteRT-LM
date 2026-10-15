@@ -409,11 +409,20 @@ class ApplePublicCExportTests(unittest.TestCase):
                     entries.append(entry)
                     framework = root / identifier / (name + '.framework')
                     framework.mkdir(parents=True)
-                    (framework / name).write_bytes(b'offline structural fixture, not native binary')
-                    (framework / 'Info.plist').write_bytes(plistlib.dumps({
-                        'CFBundleExecutable': name, 'CFBundlePackageType': 'FMWK', 'MinimumOSVersion': '26.4'}))
+                    storage = framework / 'Versions/A' if macos_arm64 else framework
+                    storage.mkdir(parents=True, exist_ok=True)
+                    (storage / name).write_bytes(b'offline structural fixture, not native binary')
+                    if macos_arm64:
+                        for sub in ['Headers', 'Modules', 'Resources']: (storage / sub).mkdir()
+                        (framework / 'Versions/Current').symlink_to('A')
+                        for sub in [name, 'Headers', 'Modules', 'Resources']:
+                            (framework / sub).symlink_to('Versions/Current/' + sub)
+                    info_path = storage / 'Resources/Info.plist' if macos_arm64 else storage / 'Info.plist'
+                    info_path.write_bytes(plistlib.dumps({
+                        'CFBundleExecutable': name, 'CFBundlePackageType': 'FMWK', 'MinimumOSVersion': '26.4',
+                        **({'LSMinimumSystemVersion': '26.4'} if macos_arm64 else {})}))
                     if name == 'CLiteRTLM':
-                        (framework / 'Headers').mkdir()
+                        if not macos_arm64: (framework / 'Headers').mkdir()
                         for header in PUBLIC_C_HEADERS:
                             shutil.copyfile(ROOT / 'c' / header, framework / 'Headers' / header)
                         if changed_header and (macos_arm64 or platform == 'IOSSIMULATOR'):
@@ -458,6 +467,8 @@ class ApplePublicCExportTests(unittest.TestCase):
                     self.assertEqual(len(result), expected_count)
                     self.assertEqual(len(signatures), expected_count)
                     self.assertEqual({row['name'] for row in result}, set(frameworks))
+                    if macos_arm64:
+                        self.assertTrue(all(row['bundleLayout'] == 'Versions/A' and len(row['symbolicLinks']) == 5 and row['installID'] == install_name(row['name']) for row in result))
 
 
 class MacArm64DevelopmentPackageTests(unittest.TestCase):
@@ -525,6 +536,349 @@ class MacArm64DevelopmentPackageTests(unittest.TestCase):
                            '/Users/runner/old-runtime.dylib', '@loader_path/foreign.dylib']:
             with self.subTest(dependency=dependency), self.assertRaises(RuntimeError):
                 validate_dependencies('CLiteRTLM_mac', [dependency], allowed)
+
+
+
+class MacVersionedFrameworkTests(unittest.TestCase):
+    def fixture(self, root):
+        from package_apple_runtime import create_macos_framework
+        binary = root / "input"
+        binary.write_bytes(b"offline-layout-control-not-a-native-library")
+        framework = create_macos_framework(root, "LiteRtRuntime", binary, {
+            "CFBundleExecutable": "LiteRtRuntime", "CFBundlePackageType": "FMWK",
+            "MinimumOSVersion": "14.0", "LSMinimumSystemVersion": "14.0"})
+        xc = root / "LiteRtRuntime.xcframework"
+        (xc / "macos-arm64").mkdir(parents=True)
+        framework.rename(xc / "macos-arm64/LiteRtRuntime.framework")
+        (xc / "Info.plist").write_bytes(b"offline-xcframework-layout-control")
+        return xc, xc / "macos-arm64/LiteRtRuntime.framework"
+
+    def testRealVersionedLayoutAndSafeArchiveRoundtrip(self):
+        from package_apple_runtime import validate_macos_layout, macos_links, zip_directory, extract_macos_archive
+        import zipfile, stat
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t); xc, framework = self.fixture(root)
+            self.assertEqual(validate_macos_layout(framework, "LiteRtRuntime"), macos_links("LiteRtRuntime"))
+            self.assertFalse((framework / "Info.plist").exists())
+            archive = root / "framework.zip"; zip_directory(xc, archive, macos=True)
+            with zipfile.ZipFile(archive) as z:
+                links = {i.filename: z.read(i).decode() for i in z.infolist() if stat.S_ISLNK(i.external_attr >> 16)}
+                self.assertEqual(len(links), 5)
+                self.assertNotIn("LiteRtRuntime.xcframework/macos-arm64/LiteRtRuntime.framework/Resources/Info.plist", z.namelist())
+            restored = extract_macos_archive(archive, root / "restored", "LiteRtRuntime", versioned=True)
+            restored_framework = restored / "macos-arm64/LiteRtRuntime.framework"
+            self.assertEqual((restored_framework / "LiteRtRuntime").read_bytes(), (framework / "LiteRtRuntime").read_bytes())
+            self.assertEqual((restored_framework / "Resources/Info.plist").read_bytes(), (framework / "Resources/Info.plist").read_bytes())
+            self.assertEqual(validate_macos_layout(restored_framework, "LiteRtRuntime"), macos_links("LiteRtRuntime"))
+
+    def testFlatBrokenEscapingAndExtraLinkLayoutsRefuse(self):
+        from package_apple_runtime import validate_macos_layout
+        for boundary in ["flatInfo", "broken", "escape", "extra"]:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as t:
+                xc, framework = self.fixture(Path(t))
+                if boundary == "flatInfo": (framework / "Info.plist").write_bytes(b"wrong-flat-info")
+                elif boundary == "extra": (framework / "Other").symlink_to("Versions/A")
+                else:
+                    (framework / "Resources").unlink()
+                    (framework / "Resources").symlink_to("Versions/Current/Absent" if boundary == "broken" else "/tmp")
+                with self.assertRaises((RuntimeError, FileNotFoundError)):
+                    validate_macos_layout(framework, "LiteRtRuntime")
+
+    def testZipTraversalUnknownLinksDuplicateAndAliasWritesRefuse(self):
+        from package_apple_runtime import extract_macos_archive, zip_directory
+        import zipfile, stat, warnings
+        for boundary in ["traversal", "unknownLink", "duplicate", "aliasWrite", "missingLink"]:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as t:
+                root = Path(t); xc, framework = self.fixture(root)
+                good = root / "good.zip"; zip_directory(xc, good, macos=True)
+                bad = root / "bad.zip"
+                with zipfile.ZipFile(good) as src, zipfile.ZipFile(bad, "x") as dst:
+                    for i in src.infolist():
+                        if boundary == "missingLink" and i.filename.endswith("/Versions/Current"): continue
+                        dst.writestr(i, src.read(i))
+                    prefix = "LiteRtRuntime.xcframework/macos-arm64/LiteRtRuntime.framework/"
+                    if boundary == "traversal": dst.writestr("../escape", b"bad")
+                    elif boundary == "unknownLink":
+                        i = zipfile.ZipInfo(prefix + "Other"); i.create_system = 3
+                        i.external_attr = (stat.S_IFLNK | 0o777) << 16; dst.writestr(i, b"../../outside")
+                    elif boundary == "duplicate":
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore"); dst.writestr(src.infolist()[0], src.read(src.infolist()[0]))
+                    elif boundary == "aliasWrite": dst.writestr(prefix + "Resources/extra", b"bad")
+                with self.assertRaises(RuntimeError):
+                    extract_macos_archive(bad, root / "out", "LiteRtRuntime", versioned=True)
+                self.assertFalse((root / "escape").exists())
+
+    def testIOSDefaultInstallAndFlatZipRemainUnchanged(self):
+        from package_apple_runtime import zip_directory
+        import zipfile
+        self.assertEqual(install_name("CLiteRTLM"), "@rpath/CLiteRTLM.framework/CLiteRTLM")
+        self.assertNotIn("Versions/", install_name("CLiteRTLM"))
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t); directory = root / "IOS.xcframework"; directory.mkdir()
+            (directory / "Info.plist").write_bytes(b"original-ios-metadata")
+            archive = root / "ios.zip"; zip_directory(directory, archive)
+            with zipfile.ZipFile(archive) as z:
+                self.assertEqual(z.namelist(), ["IOS.xcframework/Info.plist"])
+                self.assertEqual(z.read(z.namelist()[0]), b"original-ios-metadata")
+
+    def testMacRewritesOnlyRawDependenciesAndPreservesExistingFrameworkPaths(self):
+        from package_apple_runtime import MAC_LIBRARIES
+        old = ["@rpath/libLiteRt.dylib", install_name("GemmaModelConstraintProvider"), install_name("WebGpuDawn")]
+        with patch("package_apple_runtime.dependencies", return_value=old), patch("package_apple_runtime.run", return_value="fixture:\n" + install_name("CLiteRTLM")) as native:
+            rewrite_linkage(Path("fixture"), "CLiteRTLM", MAC_LIBRARIES, macos=True)
+        self.assertEqual(native.call_args_list[0].args, ("otool", "-D", "fixture"))
+        self.assertEqual([x.args for x in native.call_args_list[1:]], [("install_name_tool", "-change", old[0], install_name("LiteRtRuntime"), "fixture")])
+
+    def testAlreadyPackagedMacIDsAndDependenciesNeverInvokeInstallNameTool(self):
+        from package_apple_runtime import MAC_LIBRARIES
+        for name in ["CLiteRTLM", *MAC_LIBRARIES.values()]:
+            with self.subTest(name=name), patch("package_apple_runtime.dependencies", return_value=[install_name(n) for n in MAC_LIBRARIES.values()]), patch("package_apple_runtime.run", return_value="fixture:\n" + install_name(name)) as native:
+                rewrite_linkage(Path("fixture"), name, MAC_LIBRARIES, macos=True)
+                native.assert_called_once_with("otool", "-D", "fixture")
+                self.assertEqual(install_name(name), "@rpath/" + name + ".framework/" + name)
+
+    def testMacMetadataDeclaresBothMinimumKeysFromActualBuild(self):
+        with patch("package_apple_runtime.run", return_value=build_version_fixture("MACOS", "14.0")):
+            metadata = framework_metadata("CLiteRTLM", "MACOS", Path("fixture"))
+        self.assertEqual(metadata["LSMinimumSystemVersion"], "14.0")
+        self.assertEqual(metadata["MinimumOSVersion"], "14.0")
+
+    def testRepackageSourceSeparatesCompilerAndPackagingAndRejectsNativeChanges(self):
+        import copy
+        from package_apple_runtime import (MAC_LIBRARIES, validate_repackage_source,
+            REPACKAGE_COMPILED_SOURCE, REPACKAGE_MANIFEST_SHA256)
+        names = ["CLiteRTLM", *MAC_LIBRARIES.values()]
+        original = {"source": REPACKAGE_COMPILED_SOURCE, "archives": dict.fromkeys(names),
+            "frameworks": [{"name": n} for n in names], "architectures": ["arm64"],
+            "upstreamVersion": "0.18.0", "intelQualified": False, "productionDefaultChanged": False}
+        validate_repackage_source(original, REPACKAGE_MANIFEST_SHA256, "b" * 40, ["tools/package_apple_runtime.py"])
+        for boundary in ["source", "digest", "nativeChange", "intel", "missing"]:
+            with self.subTest(boundary=boundary):
+                value = copy.deepcopy(original); digest = REPACKAGE_MANIFEST_SHA256; changed = []
+                if boundary == "source": value["source"] = "c" * 40
+                elif boundary == "digest": digest = "0" * 64
+                elif boundary == "nativeChange": changed = ["c/conversation.cc"]
+                elif boundary == "intel": value["intelQualified"] = True
+                else: value["archives"].pop("CLiteRTLM")
+                with self.assertRaises(RuntimeError): validate_repackage_source(value, digest, "b" * 40, changed)
+
+
+    def testRetainedMacFailurePreservesExactVersionedLinks(self):
+        from package_apple_runtime import validate_macos_layout, macos_links
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t); source = root / "source.zip"; source.write_bytes(b"offline-source")
+            destination = root / "package"
+            with self.assertRaisesRegex(RuntimeError, "retained-link-fixture"):
+                with retained_package_work(source, destination, "fixture", preserve_symlinks=True) as work:
+                    self.fixture(work)
+                    raise RuntimeError("retained-link-fixture")
+            failed = root / "package-failure/LiteRtRuntime.xcframework/macos-arm64/LiteRtRuntime.framework"
+            self.assertEqual(validate_macos_layout(failed, "LiteRtRuntime"), macos_links("LiteRtRuntime"))
+            self.assertTrue((failed / "Resources").is_symlink())
+            self.assertTrue((failed / "Versions/Current").is_symlink())
+            self.assertEqual((failed / "LiteRtRuntime").read_bytes(), b"offline-layout-control-not-a-native-library")
+            self.assertFalse(json.loads((root / "package-failure/FAILURE.json").read_text())["artifactAcceptance"])
+
+
+class MacNativeContentPreservationTests(unittest.TestCase):
+    def binary(self, *, versioned=False, corrupt=False, uuid=b"x" * 16):
+        import struct
+        name = install_name("CLiteRTLM").encode() + b"\0"
+        length = (24 + len(name) + 7) & ~7
+        dylib = struct.pack("<6I", 0xd, length, 24, 0, 65536, 65536) + name
+        dylib += b"\0" * (length - len(dylib))
+        text = bytearray(152); struct.pack_into("<II", text, 0, 0x19, 152); text[8:14] = b"__TEXT"
+        struct.pack_into("<I", text, 64, 1); struct.pack_into("<Q", text, 72 + 40, 32); struct.pack_into("<I", text, 72 + 48, 512)
+        link = bytearray(72); struct.pack_into("<II", link, 0, 0x19, 72); link[8:18] = b"__LINKEDIT"
+        struct.pack_into("<Q", link, 32, 8192 if versioned else 4096); struct.pack_into("<Q", link, 40, 544); struct.pack_into("<Q", link, 48, 128)
+        commands = bytes(text) + bytes(link) + struct.pack("<II", 0x1b, 24) + uuid + dylib + struct.pack("<4I", 0x1d, 16, 640, 32)
+        header = struct.pack("<8I", 0xfeedfacf, 0x100000c, 0, 6, 5, len(commands), 0, 0)
+        data = bytearray(header + commands); data += b"\0" * (672 - len(data)); data[512:544] = bytes(range(32))
+        data[640:] = b"S" * 32
+        if corrupt: data[513] ^= 1
+        return bytes(data)
+
+    def testSigningAllocationMayChangeWithoutInstallNameGrowth(self):
+        from package_apple_runtime import require_same_native_content
+        self.assertEqual(len(require_same_native_content(self.binary(), self.binary(versioned=True), "CLiteRTLM")), 64)
+
+    def testNativePayloadUUIDOrArchitectureChangesAreRejected(self):
+        from package_apple_runtime import require_same_native_content
+        for value in [self.binary(versioned=True, corrupt=True), self.binary(versioned=True, uuid=b"y" * 16),
+                      b"wrong-architecture" + self.binary()]:
+            with self.subTest(prefix=value[:4]), self.assertRaises(RuntimeError):
+                require_same_native_content(self.binary(), value, "CLiteRTLM")
+
+
+class AppleRuntimeAssemblyTests(unittest.TestCase):
+    """Tiny synthetic framework transport only; inspect/native tools are mocked."""
+    mac_source = "b" * 40
+    mac_packaging = "c" * 40
+
+    def manifest(self, macos):
+        import package_apple_runtime as package
+        names = package.ASSEMBLY_MAC_NAMES if macos else package.ASSEMBLY_COMMON
+        slices = package.MAC_SLICES if macos else package.SLICES
+        return {"source": self.mac_source if macos else package.ASSEMBLY_IOS_SOURCE,
+            **({"packagingRevision": self.mac_packaging} if macos else {}),
+            "packagedDependencyClosure": True, "gemmaABIExportOwners": package.GEMMA_ABI_OWNERS,
+            "archives": {name: {"file": ("CLiteRTLM_mac" if macos and name == "CLiteRTLM" else name) + ".xcframework.zip",
+                "sha256": "a" * 64} for name in names},
+            "frameworks": [{"name": name, "slice": identifier, "platform": platform,
+                "sha256": "a" * 64, "dependencies": [package.install_name(name)], "minimumOS": "15.0",
+                "frameworkMinimumOSVersion": "15.0",
+                "requiredGemmaABIExports": sorted(symbol for symbol, owner in package.GEMMA_ABI_OWNERS.items() if owner == name)}
+                for identifier, (_, platform) in slices.items() for name in names]}
+
+    def validate(self, value, macos):
+        import package_apple_runtime as package
+        return package.validate_assembly_manifest(value, macos=macos,
+            compiled_source=self.mac_source if macos else package.ASSEMBLY_IOS_SOURCE,
+            packaging_revision=self.mac_packaging if macos else package.ASSEMBLY_IOS_SOURCE)
+
+    def testDistinctCompilerCohortsRetainTheExactFivePlusEightClosure(self):
+        self.assertEqual(len(self.validate(self.manifest(False), False)), 5)
+        self.assertEqual(len(self.validate(self.manifest(True), True)), 8)
+        self.assertNotEqual(self.manifest(False)["source"], self.manifest(True)["source"])
+
+    def testMissingMacExtraOrCommonArchiveCannotProduceAnIncompleteSDK(self):
+        for name in ["LiteRtTopKWebGpuSampler", "LiteRtWebGpuAccelerator", "WebGpuDawn", "CLiteRTLM"]:
+            value = self.manifest(True); del value["archives"][name]
+            with self.subTest(name=name), self.assertRaises(RuntimeError): self.validate(value, True)
+
+    def testWrongCompilerPackagingOrABIExportOwnerRefuses(self):
+        for key in ["source", "packagingRevision", "gemmaABIExportOwners"]:
+            value = self.manifest(True); value[key] = {} if key == "gemmaABIExportOwners" else "d" * 40
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.validate(value, True)
+
+    def testMissingDuplicateOrUnsupportedNativeSliceRefuses(self):
+        for mode in ["missing", "duplicate", "foreign", "wrongPlatform"]:
+            value = self.manifest(False)
+            if mode == "missing": value["frameworks"].pop()
+            elif mode == "duplicate": value["frameworks"][-1] = value["frameworks"][0]
+            elif mode == "foreign": value["frameworks"][0]["slice"] = "macos-x86_64"
+            else: value["frameworks"][0]["platform"] = "MACOS"
+            with self.subTest(mode=mode), self.assertRaises(RuntimeError): self.validate(value, False)
+
+    def testTraversalArchiveOrInvalidDigestRefusesBeforeExtraction(self):
+        for key, replacement in [("file", "../CLiteRTLM.xcframework.zip"), ("sha256", "not-a-digest"), ("bytes", True)]:
+            value = self.manifest(False); value["archives"]["CLiteRTLM"][key] = replacement
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.validate(value, False)
+
+    def framework(self, directory, name, identifiers):
+        import plistlib
+        import package_apple_runtime as package
+        directory.mkdir(parents=True)
+        entries = []
+        for identifier in identifiers:
+            framework = directory / identifier / (name + ".framework")
+            macos = identifier == "macos-arm64"
+            real = framework / "Versions/A" if macos else framework
+            for subdirectory in ["Headers", "Modules", "Resources"]: (real / subdirectory).mkdir(parents=True)
+            (real / name).write_bytes((name + ":" + identifier).encode())
+            (real / "Headers/Fixture.h").write_text("// synthetic bytes; not native C API proof\n")
+            (real / "Modules/module.modulemap").write_text("framework module " + name + " { export * }\n")
+            metadata = {"CFBundleExecutable": name, "CFBundlePackageType": "FMWK", "MinimumOSVersion": "15.0"}
+            (real / ("Resources/Info.plist" if macos else "Info.plist")).write_bytes(plistlib.dumps(metadata))
+            if macos:
+                for relative, target in package.macos_links(name).items(): (framework / relative).symlink_to(target)
+            entry = {"LibraryIdentifier": identifier, "LibraryPath": name + ".framework", "SupportedArchitectures": ["arm64"],
+                "SupportedPlatform": "macos" if macos else "ios"}
+            if identifier == "ios-arm64-simulator": entry["SupportedPlatformVariant"] = "simulator"
+            entries.append(entry)
+        (directory / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": entries,
+            "CFBundlePackageType": "XFWK", "XCFrameworkFormatVersion": "1.0"}))
+        return directory
+
+    def testCombinedThreeSliceLayoutUsesOneModuleAndExactlyFiveMacAliases(self):
+        import package_apple_runtime as package
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self.framework(Path(temporary) / "CLiteRTLM.xcframework", "CLiteRTLM", [*package.SLICES, *package.MAC_SLICES])
+            package.validate_assembly_layout(directory, "CLiteRTLM", [*package.SLICES, *package.MAC_SLICES])
+            links = [p for p in directory.rglob("*") if p.is_symlink()]
+            self.assertEqual(len(links), 5)
+            module = directory / "ios-arm64/CLiteRTLM.framework/Modules/module.modulemap"
+            module.write_text("framework module OtherCore { export * }\n")
+            with self.assertRaises(RuntimeError): package.validate_assembly_layout(directory, "CLiteRTLM", [*package.SLICES, *package.MAC_SLICES])
+
+    def testArchitectureExtraPayloadAndMissingMacAliasRefuse(self):
+        import plistlib
+        import package_apple_runtime as package
+        for mode in ["architecture", "payload", "link"]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                directory = self.framework(Path(temporary) / "WebGpuDawn.xcframework", "WebGpuDawn", package.MAC_SLICES)
+                if mode == "architecture":
+                    info = plistlib.loads((directory / "Info.plist").read_bytes())
+                    info["AvailableLibraries"][0]["SupportedArchitectures"] = ["arm64", "x86_64"]
+                    (directory / "Info.plist").write_bytes(plistlib.dumps(info))
+                elif mode == "payload": (directory / "untracked").write_text("unexpected")
+                else: (directory / "macos-arm64/WebGpuDawn.framework/Headers").unlink()
+                with self.assertRaises((RuntimeError, FileNotFoundError)):
+                    package.validate_assembly_layout(directory, "WebGpuDawn", package.MAC_SLICES)
+
+    def testZIPRoundtripPreservesAllThreeSlicesAndLiteralMacLinks(self):
+        import package_apple_runtime as package
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = self.framework(root / "CLiteRTLM.xcframework", "CLiteRTLM", [*package.SLICES, *package.MAC_SLICES])
+            archive = root / "core.zip"; package.zip_directory(directory, archive, macos=True)
+            package.verify_assembly_zip(archive, directory, "CLiteRTLM")
+            (directory / "ios-arm64/CLiteRTLM.framework/CLiteRTLM").write_bytes(b"changed")
+            with self.assertRaises(RuntimeError): package.verify_assembly_zip(archive, directory, "CLiteRTLM")
+
+    def testCompilerReleaseAncestryMustMatchWithoutConflatingSourceIDs(self):
+        import package_apple_runtime as package
+        release = {"tag": "v0.18.0", "commit": "e" * 40}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); (root / "UPSTREAM_RELEASE.json").write_text(json.dumps(release))
+            with patch("package_apple_runtime.ROOT", root), patch("package_apple_runtime.run", return_value=json.dumps(release)) as git:
+                self.assertEqual(package.assembly_upstream_release([package.ASSEMBLY_IOS_SOURCE, self.mac_source]), release)
+                self.assertEqual([call.args[-1] for call in git.call_args_list],
+                    [package.ASSEMBLY_IOS_SOURCE + ":UPSTREAM_RELEASE.json", self.mac_source + ":UPSTREAM_RELEASE.json"])
+            with patch("package_apple_runtime.ROOT", root), patch("package_apple_runtime.run", return_value=json.dumps({**release, "commit": "f" * 40})):
+                with self.assertRaises(RuntimeError): package.assembly_upstream_release([self.mac_source])
+
+    def testSyntheticWholeAssemblyPreservesBytesAndNeverRewritesOrResigns(self):
+        import copy
+        import package_apple_runtime as package
+        sentinels = set(package.PUBLIC_C_SENTINELS)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); input_manifests = {}; hashes = {}
+            for platform, macos in [("ios", False), ("macos", True)]:
+                artifact = root / platform; artifact.mkdir(); value = self.manifest(macos)
+                for name, row in value["archives"].items():
+                    directory = self.framework(root / (platform + "-trees") / (name + ".xcframework"), name,
+                        package.MAC_SLICES if macos else package.SLICES)
+                    for observed in value["frameworks"]:
+                        if observed["name"] == name: observed["sha256"] = package.digest(directory / observed["slice"] / (name + ".framework") / name)
+                    archive = artifact / row["file"]; package.zip_directory(directory, archive, macos=macos)
+                    row.update(sha256=package.digest(archive), bytes=archive.stat().st_size)
+                (artifact / "APPLE_RUNTIME_MANIFEST.json").write_text(json.dumps(value))
+                hashes[platform] = package.digest(artifact / "APPLE_RUNTIME_MANIFEST.json"); input_manifests[platform] = value
+            (root / "UPSTREAM_RELEASE.json").write_text(json.dumps({"tag": "v0.18.0", "commit": "e" * 40}))
+            def command(*args):
+                self.assertEqual(args[0], "git")
+                if "rev-parse" in args: return "d" * 40
+                if "status" in args: return ""
+                return (root / "UPSTREAM_RELEASE.json").read_text()
+            def inspection(frameworks, *, macos_arm64=False):
+                return copy.deepcopy(input_manifests["macos" if macos_arm64 else "ios"]["frameworks"])
+            with patch("package_apple_runtime.ROOT", root), patch("package_apple_runtime.run", side_effect=command), \
+                    patch("package_apple_runtime.inspect", side_effect=inspection), \
+                    patch("package_apple_runtime.exported_symbols", return_value=sentinels), \
+                    patch("package_apple_runtime.rewrite_linkage") as rewrite:
+                package.assemble_apple_artifacts(root / "ios", root / "macos", root / "output", hashes["ios"], hashes["macos"],
+                    self.mac_source, self.mac_packaging)
+                rewrite.assert_not_called()
+            report = json.loads((root / "output/APPLE_RUNTIME_MANIFEST.json").read_bytes())
+            self.assertEqual(len(report["archives"]), 8); self.assertEqual(len(report["frameworks"]), 18)
+            self.assertEqual(report["platformProvenance"]["ios-arm64"]["compiledSource"], package.ASSEMBLY_IOS_SOURCE)
+            self.assertEqual(report["platformProvenance"]["macos-arm64"]["compiledSource"], self.mac_source)
+            self.assertFalse(report["gpuRegistrationQualified"]); self.assertFalse(report["modelAcceptance"])
+            self.assertEqual(len(report["archives"]["CLiteRTLM"]["slices"]), 3)
+            self.assertEqual(report["archives"]["WebGpuDawn"]["slices"], ["macos-arm64"])
+            self.assertTrue(all(set(row["definedExports"]) >= sentinels for row in report["frameworks"] if row["name"] == "CLiteRTLM"))
 
 
 if __name__ == "__main__":
