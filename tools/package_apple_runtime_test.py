@@ -154,7 +154,7 @@ class AppleRuntimeMinimumOSTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Ambiguous/missing"):
                 framework_metadata("GemmaModelConstraintProvider", "IOS", Path("fixture-binary"))
         with self.assertRaisesRegex(RuntimeError, "Unsupported Apple runtime platform"):
-            minimum_os_from_build(build_version_fixture(), "MACOS")
+            minimum_os_from_build(build_version_fixture(), "WATCHOS")
 
     def testFinalInspectionMetadataMustCoverActualMinimumWithoutProductPolicy(self):
         validate_minimum_os_metadata("15.0", "15")
@@ -365,18 +365,30 @@ class ApplePublicCExportTests(unittest.TestCase):
     def testProviderCreationInRuntimeCannotReplaceItsProviderOwner(self):
         self.inspectFixture(wrong_owner=('LiteRtLmGemmaModelConstraintProvider_Create', 'CLiteRTLM'))
 
+    def testMacArm64WholeSDKReadsBackEveryPublicCExportAndDependencyFramework(self):
+        self.inspectFixture(macos_arm64=True)
+        self.inspectFixture(macos_arm64=True, missing_slice='macos-arm64',
+                            missing=('CLiteRTLM', 'litert_lm_engine_count_first_input_text_tokens'))
+        self.inspectFixture(macos_arm64=True, changed_header='conversation.h')
+        self.inspectFixture(macos_arm64=True, missing_slice='macos-arm64',
+                            missing=('GemmaModelConstraintProvider', 'LiteRtLmGemmaModelConstraintProvider_Create'))
+
     def inspectFixture(self, missing=None, changed_header=None,
-                       missing_slice='ios-arm64-simulator', wrong_owner=None):
+                       missing_slice='ios-arm64-simulator', wrong_owner=None, macos_arm64=False):
         # Structural Python control only: every native command is mocked.
         import plistlib
         import shutil
         from package_apple_runtime import (ROOT, PUBLIC_C_HEADERS, public_c_exports,
-                                          GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS, SAMPLER_FUNCTIONS, SLICES)
+                                          GEMMA_PROVIDER_FUNCTIONS, GEMMA_ABI_OWNERS, SAMPLER_FUNCTIONS, SLICES, MAC_SLICES, MAC_LIBRARIES)
+        slices = MAC_SLICES if macos_arm64 else SLICES
+        libraries = MAC_LIBRARIES if macos_arm64 else LIBRARIES
         core = public_c_exports(ROOT / 'c')
         exports = {'CLiteRTLM': set(core), 'LiteRtRuntime': {'kLiteRtRuntimeBuiltin'},
                    'GemmaModelConstraintProvider': set(),
                    'LiteRtMetalAccelerator': {'LiteRtAcceleratorImpl'},
                    'LiteRtTopKMetalSampler': SAMPLER_FUNCTIONS}
+        for name in libraries.values():
+            exports.setdefault(name, set())
         for name, owner in GEMMA_ABI_OWNERS.items():
             exports[owner].add(name)
         if wrong_owner:
@@ -385,13 +397,13 @@ class ApplePublicCExportTests(unittest.TestCase):
             exports[owner].add(name)
         with tempfile.TemporaryDirectory() as temporary:
             frameworks = {}
-            for name in ['CLiteRTLM', *LIBRARIES.values()]:
+            for name in ['CLiteRTLM', *libraries.values()]:
                 root = Path(temporary) / (name + '.xcframework')
                 root.mkdir()
                 entries = []
-                for identifier, (_, platform) in SLICES.items():
+                for identifier, (_, platform) in slices.items():
                     entry = {'LibraryIdentifier': identifier, 'LibraryPath': name + '.framework',
-                             'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}
+                             'SupportedPlatform': 'macos' if macos_arm64 else 'ios', 'SupportedArchitectures': ['arm64']}
                     if platform == 'IOSSIMULATOR':
                         entry['SupportedPlatformVariant'] = 'simulator'
                     entries.append(entry)
@@ -404,7 +416,7 @@ class ApplePublicCExportTests(unittest.TestCase):
                         (framework / 'Headers').mkdir()
                         for header in PUBLIC_C_HEADERS:
                             shutil.copyfile(ROOT / 'c' / header, framework / 'Headers' / header)
-                        if changed_header and platform == 'IOSSIMULATOR':
+                        if changed_header and (macos_arm64 or platform == 'IOSSIMULATOR'):
                             (framework / 'Headers' / changed_header).write_text('changed source bytes\n')
                 (root / 'Info.plist').write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
                 frameworks[name] = root
@@ -413,7 +425,7 @@ class ApplePublicCExportTests(unittest.TestCase):
                 if args[:2] == ('lipo', '-archs'):
                     return 'arm64'
                 if args[:2] == ('vtool', '-show-build'):
-                    platform = 'IOSSIMULATOR' if 'ios-arm64-simulator' in args[2] else 'IOS'
+                    platform = 'MACOS' if macos_arm64 else 'IOSSIMULATOR' if 'ios-arm64-simulator' in args[2] else 'IOS'
                     return build_version_fixture(platform)
                 if args[:2] == ('otool', '-D'):
                     return args[2] + ':\n' + install_name(Path(args[2]).name)
@@ -434,17 +446,85 @@ class ApplePublicCExportTests(unittest.TestCase):
                     patch('package_apple_runtime.exported_symbols', side_effect=symbols):
                 if missing or changed_header or wrong_owner:
                     with self.assertRaisesRegex(RuntimeError, 'Missing public|tool constraint|header differs'):
-                        inspect(frameworks)
+                        inspect(frameworks, macos_arm64=macos_arm64)
                     blocked_name = (GEMMA_ABI_OWNERS[wrong_owner[0]] if wrong_owner
                                     else missing[0] if missing else 'CLiteRTLM')
-                    blocked_slice = 'ios-arm64' if wrong_owner else missing_slice
+                    blocked_slice = 'macos-arm64' if macos_arm64 else 'ios-arm64' if wrong_owner else missing_slice
                     self.assertFalse(any(p.name == blocked_name + '.framework'
                                          and blocked_slice in p.parts for p in signatures))
                 else:
-                    result = inspect(frameworks)
-                    self.assertEqual(len(result), 10)
-                    self.assertEqual(len(signatures), 10)
+                    result = inspect(frameworks, macos_arm64=macos_arm64)
+                    expected_count = 8 if macos_arm64 else 10
+                    self.assertEqual(len(result), expected_count)
+                    self.assertEqual(len(signatures), expected_count)
                     self.assertEqual({row['name'] for row in result}, set(frameworks))
+
+
+class MacArm64DevelopmentPackageTests(unittest.TestCase):
+    def testMacMetadataRetainsRealMinimumAndRejectsIOS(self):
+        with patch('package_apple_runtime.run', return_value=build_version_fixture('MACOS', '12.0')):
+            result = framework_metadata('CLiteRTLM', 'MACOS', Path('fixture'))
+            self.assertEqual(result['MinimumOSVersion'], '12.0')
+            self.assertEqual(result['CFBundleSupportedPlatforms'], ['MacOSX'])
+        with self.assertRaisesRegex(RuntimeError, 'Wrong/ambiguous'):
+            minimum_os_from_build(build_version_fixture('IOS'), 'MACOS')
+
+    def testDeclaredBazelOutputRejectsAmbiguousMissingAndEscapingPaths(self):
+        from package_apple_runtime import resolve_macos_bazel_output
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); listing = root / 'outputs.txt'
+            binary = root / 'bazel-out/apple/bin/swift/libCLiteRTLM.dylib'
+            binary.parent.mkdir(parents=True); binary.write_bytes(b'offline fixture only')
+            with patch('package_apple_runtime.ROOT', root):
+                listing.write_text(str(binary.relative_to(root)) + '\n')
+                self.assertEqual(resolve_macos_bazel_output(listing), binary)
+                for value in ['', '/other.dylib', 'bazel-out/../other.dylib',
+                              'bazel-out/missing.dylib', 'bazel-out/file.a',
+                              'bazel-out/a.dylib\nbazel-out/b.dylib']:
+                    listing.write_text(value)
+                    with self.subTest(value=value), self.assertRaises(RuntimeError):
+                        resolve_macos_bazel_output(listing)
+
+    def testMacDependenciesAreExactCommittedLFSPayloadsNotAnotherSDK(self):
+        from package_apple_runtime import pinned_macos_libraries, digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); binary = root / 'prebuilt/macos_arm64/libLiteRt.dylib'
+            binary.parent.mkdir(parents=True); binary.write_bytes(b'offline fixture only')
+            pointer = ('version https://git-lfs.github.com/spec/v1\noid sha256:' + digest(binary)
+                       + '\nsize ' + str(binary.stat().st_size))
+            def native(*args):
+                if args[0] == 'git': return pointer
+                if args[0] == 'lipo': return 'arm64'
+                if args[0] == 'vtool': return build_version_fixture('MACOS', '12.0')
+                self.fail('Unexpected native call ' + repr(args))
+            with patch('package_apple_runtime.ROOT', root), \
+                    patch('package_apple_runtime.MAC_LIBRARIES', {'libLiteRt.dylib': 'LiteRtRuntime'}), \
+                    patch('package_apple_runtime.run', side_effect=native):
+                rows = pinned_macos_libraries()
+                self.assertEqual(rows[0]['sha256'], digest(binary))
+                for change in ['content', 'size', 'architecture', 'platform', 'symlink']:
+                    with self.subTest(change=change):
+                        if change == 'content': binary.write_bytes(b'changed fixture only')
+                        elif change == 'size': binary.write_bytes(b'offline fixture only' + b'!')
+                        elif change == 'symlink':
+                            binary.unlink(); binary.symlink_to(root / 'foreign-file')
+                        if change in {'architecture', 'platform'}:
+                            def wrong(*args):
+                                if change == 'architecture' and args[0] == 'lipo': return 'arm64 x86_64'
+                                if change == 'platform' and args[0] == 'vtool': return build_version_fixture('IOS')
+                                return native(*args)
+                            with patch('package_apple_runtime.run', side_effect=wrong), self.assertRaises(RuntimeError):
+                                pinned_macos_libraries()
+                        else:
+                            with self.assertRaises(RuntimeError): pinned_macos_libraries()
+                        if change != 'symlink': binary.write_bytes(b'offline fixture only')
+
+    def testMacReadbackCannotAdmitUnpackagedOrForeignRuntimeDependencies(self):
+        allowed = {install_name('LiteRtRuntime'), install_name('GemmaModelConstraintProvider')}
+        for dependency in ['@rpath/libLiteRt.dylib', '@rpath/Foreign.framework/Foreign',
+                           '/Users/runner/old-runtime.dylib', '@loader_path/foreign.dylib']:
+            with self.subTest(dependency=dependency), self.assertRaises(RuntimeError):
+                validate_dependencies('CLiteRTLM_mac', [dependency], allowed)
 
 
 if __name__ == "__main__":

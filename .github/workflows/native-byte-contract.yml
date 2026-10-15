@@ -17,6 +17,10 @@ on:
         description: Run the bounded session submission reentry controls
         default: false
         type: boolean
+      macos_arm64_only:
+        description: Build an arm64-only development SDK after all host gates (official universal default unchanged)
+        default: false
+        type: boolean
       host_only:
         description: Run every native host gate and skip framework build/package
         default: false
@@ -40,6 +44,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           lfs: false
+      - name: Validate explicit producer mode
+        env:
+          MAC_ARM64_ONLY: ${{ inputs.macos_arm64_only }}
+          HOST_ONLY: ${{ inputs.host_only }}
+        run: |
+          if [ "$MAC_ARM64_ONLY" = true ] && [ "$HOST_ONLY" = true ]; then
+            echo "Choose host-only or Mac artifact production, not both" >&2
+            exit 1
+          fi
       - name: Fetch only required native platform libraries
         run: |
           git lfs install --local
@@ -149,7 +162,7 @@ jobs:
             cp -RL bazel-testlogs native-test-results
           fi
       - name: Build device and simulator framework
-        if: ${{ !inputs.host_only }}
+        if: ${{ !inputs.host_only && !inputs.macos_arm64_only }}
         run: |
           set -o pipefail
           "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=2 \
@@ -158,16 +171,34 @@ jobs:
             --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
             //swift:CLiteRTLM 2>&1 | tee native-framework.log
       - name: Package and verify the Apple runtime dependency graph
-        if: ${{ !inputs.host_only }}
+        if: ${{ !inputs.host_only && !inputs.macos_arm64_only }}
         run: |
           set -o pipefail
           python3 tools/package_apple_runtime.py bazel-bin/swift/CLiteRTLM.xcframework.zip native-artifact \
             2>&1 | tee native-package.log
+      - name: Build whole Mac arm64 development SDK
+        if: ${{ inputs.macos_arm64_only && !inputs.host_only }}
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" build --config=macos_arm64 -c opt --jobs=2 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=3G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=4096 --define=litert_runtime_link_mode=dynamic \
+            //swift:CLiteRTLM_dylib 2>&1 | tee native-macos-framework.log
+          "$RUNNER_TEMP/bazelisk" cquery --config=macos_arm64 -c opt \
+            --define=litert_runtime_link_mode=dynamic \
+            //swift:CLiteRTLM_dylib --output=files > native-macos-output-files.txt
+      - name: Package and read back Mac arm64 development SDK
+        if: ${{ inputs.macos_arm64_only && !inputs.host_only }}
+        run: |
+          set -o pipefail
+          python3 tools/package_apple_runtime.py --macos-arm64 native-macos-output-files.txt native-macos-arm64-artifact \
+            2>&1 | tee native-macos-package.log
       - name: Retain native evidence and framework
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ${{ inputs.host_only && 'native-host-contract' || 'native-byte-contract' }}-${{ github.sha }}
+          name: ${{ inputs.macos_arm64_only && 'native-macos-arm64-development' || inputs.host_only && 'native-host-contract' || 'native-byte-contract' }}-${{ github.sha }}
           path: |
             native-host-receipt.json
             native-scheduling-tests.log
@@ -177,6 +208,11 @@ jobs:
             native-c-stream-terminal-tests.log
             native-framework.log
             native-package.log
+            native-macos-framework.log
+            native-macos-output-files.txt
+            native-macos-package.log
+            native-macos-arm64-artifact/
+            native-macos-arm64-artifact-failure/
             native-artifact/
             native-artifact-failure/
             bazel-bin/swift/CLiteRTLM.xcframework.zip
