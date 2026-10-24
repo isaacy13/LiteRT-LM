@@ -1,0 +1,89 @@
+name: GuideAI iOS runtime
+
+# Builds CLiteRTLM.xcframework for iOS (device + simulator) from this branch and
+# packages the pinned prebuilt runtime, Metal accelerator, Metal sampler and
+# Gemma constraint provider as separate frameworks (tools/package_apple_runtime.py).
+
+on:
+  push:
+    branches: ["guideai/ios-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guideai-ios-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 340
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          lfs: false
+      - name: Fetch the iOS prebuilt runtime libraries
+        run: |
+          git lfs install --local
+          git lfs pull --include='prebuilt/ios_arm64/*.dylib,prebuilt/ios_sim_arm64/*.dylib'
+      - name: Install pinned Bazelisk
+        run: |
+          test "$(uname -m)" = arm64
+          curl -fL --retry 3 -o "$RUNNER_TEMP/bazelisk" https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-darwin-arm64
+          echo 'cee851f726789227d5561004e9904a52be45c3efb56f8b38b6993d6adbaa0409  '"$RUNNER_TEMP/bazelisk" | shasum -a 256 -c -
+          chmod +x "$RUNNER_TEMP/bazelisk"
+      - name: Identify compiler cache
+        id: toolchain
+        run: |
+          echo "BAZEL_DISK_CACHE=$RUNNER_TEMP/guideai-ios-bazel-cache" >> "$GITHUB_ENV"
+          fingerprint=$( { xcodebuild -version; xcrun clang --version; } | shasum -a 256 | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          xcodebuild -version
+          df -h "$RUNNER_TEMP"
+      - name: Restore compilation cache
+        id: cache
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.BAZEL_DISK_CACHE }}
+          key: guideai-ios-bazel-v1-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**', 'patches/**') }}-${{ github.sha }}
+          restore-keys: |
+            guideai-ios-bazel-v1-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('.bazelversion', 'WORKSPACE', '.bazelrc', 'BUILD.llguidance', 'build_config/**', 'patches/**') }}-
+      - name: Verify pinned Apple runtime slices
+        run: python3 tools/verify_apple_prebuilt_runtime.py
+      - name: Build device and simulator framework
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/bazelisk" build --config=ios_arm64 -c opt --jobs=3 \
+            --disk_cache="$BAZEL_DISK_CACHE" --experimental_disk_cache_gc_max_size=6G \
+            --experimental_disk_cache_gc_idle_delay=1s \
+            --local_ram_resources=5120 --define=litert_runtime_link_mode=dynamic \
+            //swift:CLiteRTLM 2>&1 | tee ios-framework.log
+      - name: Package and verify the Apple runtime dependency graph
+        run: |
+          set -o pipefail
+          python3 tools/package_apple_runtime.py bazel-bin/swift/CLiteRTLM.xcframework.zip ios-runtime \
+            2>&1 | tee ios-package.log
+      - name: Retain framework and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guideai-ios-runtime-${{ github.sha }}
+          path: |
+            ios-framework.log
+            ios-package.log
+            ios-runtime/
+            ios-runtime-failure/
+            bazel-bin/swift/CLiteRTLM.xcframework.zip
+          if-no-files-found: warn
+      - name: Save compilation cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.BAZEL_DISK_CACHE }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}

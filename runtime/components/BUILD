@@ -207,11 +207,31 @@ cc_test(
     ],
 )
 
+# iOS runtime APIs are strong dependencies, packaged as separate frameworks.
+cc_library(
+    name = "apple_metal_sampler_lib",
+    srcs = select({
+        "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtTopKMetalSampler.dylib"],
+        "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtTopKMetalSampler.dylib"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_library(
+    name = "apple_metal_accelerator_lib",
+    srcs = select({
+        "//build_config:ios_arm64": ["//prebuilt/ios_arm64:libLiteRtMetalAccelerator.dylib"],
+        "//build_config:ios_sim_arm64": ["//prebuilt/ios_sim_arm64:libLiteRtMetalAccelerator.dylib"],
+        "//conditions:default": [],
+    }),
+)
+
 cc_library(
     name = "sampler_factory",
     srcs = ["sampler_factory.cc"],
     hdrs = ["sampler_factory.h"],
     deps = [
+        ":apple_metal_sampler_lib",
         ":sampler",
         ":top_p_cpu_sampler",
         "@com_google_absl//absl/base:core_headers",

@@ -22,6 +22,14 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "litert/c/internal/litert_accelerator_def.h"  // from @litert
+extern "C" const LiteRtAcceleratorDef LiteRtAcceleratorImpl;
+#endif
+#endif
+
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl  // IWYU pragma: keep
@@ -40,6 +48,24 @@
 namespace litert::lm {
 
 namespace {
+
+// Keep the accelerator definition owned by the linked iOS framework for the
+// environment lifetime. This is the pinned runtime's custom accelerator ABI;
+// app code does not receive a handle or configure internal runtime options.
+void AddAppleMetalAccelerator(
+    Backend backend,
+    const std::optional<VisionExecutorSettings>& vision_settings,
+    const std::optional<AudioExecutorSettings>& audio_settings,
+    std::vector<EnvironmentOptions::Option>& options) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  if (backend == Backend::GPU ||
+      (vision_settings.has_value() && vision_settings->GetBackend() == Backend::GPU) ||
+      (audio_settings.has_value() && audio_settings->GetBackend() == Backend::GPU)) {
+    options.emplace_back(EnvironmentOptions::Tag::kSystemGpuAcceleratorHandle,
+                         const_cast<LiteRtAcceleratorDef*>(&LiteRtAcceleratorImpl));
+  }
+#endif
+}
 
 bool UsesNpu(Backend backend,
              const std::optional<VisionExecutorSettings>& vision_settings,
@@ -164,6 +190,8 @@ absl::StatusOr<OwnedEnvironment> CreateEnvironment(
         static_cast<int64_t>(ToLiteRtLogSeverityInt8(*severity))});
   }
 
+  AddAppleMetalAccelerator(backend, engine_settings.GetVisionExecutorSettings(),
+                          engine_settings.GetAudioExecutorSettings(), env_options);
   LITERT_ASSIGN_OR_RETURN(auto env,
                           Environment::Create(EnvironmentOptions(env_options)));
   return OwnedEnvironment{std::move(helper), std::move(env)};
@@ -188,6 +216,8 @@ absl::StatusOr<OwnedEnvironment> CreateEnvironment(
         static_cast<int64_t>(ToLiteRtLogSeverityInt8(*severity))});
   }
 
+  AddAppleMetalAccelerator(backend, engine_settings.GetVisionExecutorSettings(),
+                          engine_settings.GetAudioExecutorSettings(), env_options);
   LITERT_ASSIGN_OR_RETURN(auto env,
                           Environment::Create(EnvironmentOptions(env_options)));
   return OwnedEnvironment{std::move(helper), std::move(env)};

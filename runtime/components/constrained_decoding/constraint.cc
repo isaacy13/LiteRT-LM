@@ -47,3 +47,14 @@ absl::StatusOr<std::unique_ptr<LogitMask>> Constraint::ComputeMask(
 }
 
 }  // namespace litert::lm
+
+#if defined(__APPLE__)
+// The pinned Apple provider exports creation only. Its opaque result has the
+// same virtual Constraint ownership already used by the model processors. Keep
+// generic destruction in the source-built runtime; do not add a second owner.
+struct LiteRtLmConstraint;
+extern "C" __attribute__((visibility("default")))
+void LiteRtLmConstraint_Destroy(LiteRtLmConstraint* constraint) {
+  delete reinterpret_cast<litert::lm::Constraint*>(constraint);
+}
+#endif

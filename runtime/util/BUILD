@@ -506,6 +506,8 @@ cc_library(
     srcs = ["litert_util.cc"],
     hdrs = ["litert_util.h"],
     deps = [
+        "//runtime/components:apple_metal_accelerator_lib",
+        "@litert//litert/c/internal:litert_accelerator_def",
         ":logging",
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status:statusor",
